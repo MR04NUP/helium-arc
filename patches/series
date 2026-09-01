@@ -1,6 +1,4 @@
 upstream-fixes/missing-dependencies.patch
-upstream-fixes/fix-non-git-gclient.patch
-upstream-fixes/global-privacy-control.patch
 
 inox-patchset/fix-building-without-safebrowsing.patch
 inox-patchset/disable-autofill-download-manager.patch
@@ -35,6 +33,7 @@ ungoogled-chromium/move-js-optimizer-unfamiliar-sites.patch
 ungoogled-chromium/build-with-wasm-rollup.patch
 ungoogled-chromium/remove-navigation-source-param.patch
 ungoogled-chromium/bundle-hyphenation-patterns.patch
+ungoogled-chromium/disable-tos-dialog.patch
 
 bromite/disable-fetching-field-trials.patch
 
@@ -127,7 +126,14 @@ helium/core/sync/datatype-policy.patch
 helium/core/sync/vault-format.patch
 helium/core/sync/vault-encryption.patch
 helium/core/sync/vault-transport.patch
-helium/core/sync/vault-store-read.patch
+helium/core/sync/vault-store.patch
+helium/core/sync/loopback-server-in-memory.patch
+helium/core/sync/history-expiration-threshold.patch
+helium/core/sync/vault-engine-backend.patch
+helium/core/sync/provider/api-contract.patch
+helium/core/sync/provider/manifest-handler.patch
+helium/core/sync/provider/profile-prefs.patch
+helium/core/sync/disable-google-backed-sync-integrations.patch
 
 helium/settings/setup-behavior-settings-page.patch
 helium/core/keyboard-shortcuts.patch
@@ -217,6 +223,7 @@ helium/core/crash-reporter-privacy-tweaks.patch
 helium/core/crash-reporting-prefs.patch
 helium/core/disable-omnibox-webui.patch
 helium/core/rbe-nativelink-config.patch
+helium/core/disable-non-standard-auth-features.patch
 
 helium/settings/settings-page-icons.patch
 helium/settings/move-search-suggest.patch
@@ -242,6 +249,7 @@ helium/settings/clear-browsing-data-popup.patch
 helium/settings/crash-reporting-settings.patch
 helium/settings/helium-noise-settings.patch
 helium/settings/network-and-security-page.patch
+helium/settings/sync-setup-contract.patch
 
 helium/hop/setup.patch
 helium/hop/disable-password-manager.patch
@@ -315,7 +323,6 @@ helium/ui/custom-keyboard-shortcuts-wiring.patch
 helium/ui/crash-dialog.patch
 helium/ui/crashes-webui-fixes.patch
 
-helium/ui/layout/migrate-prefs.patch
 helium/ui/layout/core.patch
 helium/ui/layout/settings.patch
 helium/ui/layout/context-menu.patch
@@ -343,3 +350,5 @@ helium/ui/native-frame-materials.patch
 helium/ui/page-zoom-indicator.patch
 helium/ui/add-more-zoom-presets.patch
 helium/ui/helium-noise-page-info.patch
+helium/ui/show-tabs-from-non-account-backends.patch
+helium/ui/compact-debugger-warning.patch
