@@ -374,6 +374,7 @@ helium/ui/disable-ink-ripple-effect.patch
 helium/ui/dont-antialias-rects.patch
 helium/ui/fix-windows-ui-position.patch
 helium/ui/native-frame-materials.patch
+helium/ui/exact-user-color.patch
 helium/ui/page-zoom-indicator.patch
 helium/ui/add-more-zoom-presets.patch
 helium/ui/helium-noise-page-info.patch
