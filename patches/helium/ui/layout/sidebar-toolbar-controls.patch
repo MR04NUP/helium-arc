@@ -1,0 +1,546 @@
+--- a/chrome/app/generated_resources.grd
++++ b/chrome/app/generated_resources.grd
+@@ -10708,6 +10708,10 @@ Keep your key file in a safe place. You
+       </if>
+       <!-- /Helium Browser Layout Strings -->
+ 
++      <message name="IDS_SIDEBAR_PAGE_MENU_MORE" desc="The last item of the short menu opened from the three-dots button beside the address bar when the toolbar is shown in the vertical tabs sidebar. Opens the full browser menu.">
++        More
++      </message>
++
+       <!-- Vertical Tab Strings -->
+       <message name="IDS_SWITCH_TO_VERTICAL_TAB" desc="The button in context menu that switches to vertical tab view.">
+         Show tabs vertically
+--- a/chrome/browser/ui/views/toolbar/browser_app_menu_button.cc
++++ b/chrome/browser/ui/views/toolbar/browser_app_menu_button.cc
+@@ -130,6 +130,7 @@ void BrowserAppMenuButton::OnMenuClosed(
+   }
+ #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   AppMenuButton::OnMenuClosed();
++  toolbar_view_->UpdateSidebarControlsReveal();
+ }
+ 
+ void BrowserAppMenuButton::OnThemeChanged() {
+@@ -255,6 +256,13 @@ void BrowserAppMenuButton::ButtonPressed
+   }
+ #endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)
+ 
++  // Beside the address bar in the sidebar, the button opens a short page menu
++  // that leads to this one.
++  if (toolbar_view_->is_sidebar_mode()) {
++    toolbar_view_->ShowSidebarPageMenu();
++    return;
++  }
++
+   ShowMenu(event.IsKeyEvent() ? (views::MenuRunner::SHOULD_SHOW_MNEMONICS |
+                                  views::MenuRunner::INVOKED_FROM_KEYBOARD)
+                               : views::MenuRunner::NO_FLAGS);
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -23,6 +23,7 @@
+ #include "base/notimplemented.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/task/sequenced_task_runner.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+ #include "chrome/app/chrome_command_ids.h"
+@@ -165,11 +166,14 @@
+ #include "ui/gfx/image/canvas_image_source.h"
+ #include "ui/gfx/paint_vector_icon.h"
+ #include "ui/gfx/scoped_canvas.h"
++#include "ui/menus/simple_menu_model.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/actions/action_view_controller.h"
+ #include "ui/views/background.h"
+ #include "ui/views/cascading_property.h"
+ #include "ui/views/controls/button/label_button.h"
++#include "ui/views/controls/menu/menu_model_adapter.h"
++#include "ui/views/controls/menu/menu_runner.h"
+ #include "ui/views/controls/separator.h"
+ #include "ui/views/layout/fill_layout.h"
+ #include "ui/views/layout/flex_layout.h"
+@@ -212,6 +216,66 @@ constexpr int kSidebarToolbarDefaultWidt
+ constexpr base::TimeDelta kSidebarControlsRevealDuration =
+     base::Milliseconds(150);
+ 
++// The short menu shown by the three-dots button beside the address bar in
++// sidebar mode. It holds what the hidden toolbar buttons did, and leads to the
++// app menu for everything else.
++class SidebarPageMenuModel : public ui::SimpleMenuModel,
++                             public ui::SimpleMenuModel::Delegate {
++ public:
++  // Entries without a browser command. Browser commands use their IDC_ values,
++  // which are far larger.
++  enum Command {
++    kShowExtensionsMenu = 1,
++    kShowAppMenu,
++  };
++
++  SidebarPageMenuModel(BrowserWindowInterface* browser,
++                       bool has_extensions,
++                       base::RepeatingClosure show_extensions_menu,
++                       base::RepeatingClosure show_app_menu)
++      : ui::SimpleMenuModel(this),
++        browser_(browser),
++        show_extensions_menu_(std::move(show_extensions_menu)),
++        show_app_menu_(std::move(show_app_menu)) {
++    AddItemWithStringId(IDC_RELOAD, IDS_APP_MENU_RELOAD);
++    AddItemWithStringId(IDC_COPY_URL, IDS_COPY_URL);
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    if (has_extensions) {
++      AddItemWithStringId(kShowExtensionsMenu, IDS_EXTENSIONS_SUBMENU);
++    }
++    AddItemWithStringId(IDC_SHOW_AVATAR_MENU, IDS_PROFILES_MENU_NAME);
++    AddSeparator(ui::NORMAL_SEPARATOR);
++    AddItemWithStringId(kShowAppMenu, IDS_SIDEBAR_PAGE_MENU_MORE);
++  }
++
++  ~SidebarPageMenuModel() override = default;
++
++  // ui::SimpleMenuModel::Delegate:
++  bool IsCommandIdEnabled(int command_id) const override {
++    return command_id == kShowExtensionsMenu || command_id == kShowAppMenu ||
++           chrome::IsCommandEnabled(browser_, command_id);
++  }
++
++  void ExecuteCommand(int command_id, int event_flags) override {
++    switch (command_id) {
++      case kShowExtensionsMenu:
++        show_extensions_menu_.Run();
++        break;
++      case kShowAppMenu:
++        show_app_menu_.Run();
++        break;
++      default:
++        chrome::ExecuteCommand(browser_, command_id);
++        break;
++    }
++  }
++
++ private:
++  const raw_ptr<BrowserWindowInterface> browser_;
++  base::RepeatingClosure show_extensions_menu_;
++  base::RepeatingClosure show_app_menu_;
++};
++
+ class DynamicNewTabToolbarButton : public ToolbarButton {
+  public:
+   explicit DynamicNewTabToolbarButton(PressedCallback callback)
+@@ -2293,6 +2357,7 @@ void ToolbarView::SetSidebarMode(bool si
+   } else {
+     sidebar_hover_handler_.reset();
+     sidebar_controls_animation_.Reset(0);
++    UpdateSidebarPageActionsVisibility(/*controls_revealed=*/false);
+   }
+ 
+   // The vertical tab strip paints behind a hosted toolbar.
+@@ -2306,6 +2371,9 @@ void ToolbarView::SetSidebarMode(bool si
+     extensions_container_->GetExtensionsButton()->SetVisible(!sidebar_mode_);
+   }
+ 
++  // The address bar shows less of the URL in the sidebar.
++  location_bar_->UpdateWithoutTabRestore();
++
+   UpdateToolbarLayout();
+   PreferredSizeChanged();
+   SchedulePaint();
+@@ -2322,6 +2390,11 @@ void ToolbarView::SetSidebarCaptionButto
+   InvalidateLayout();
+ }
+ 
++int ToolbarView::GetSidebarCaptionRowHeight() const {
++  return GetLayoutConstant(LayoutConstant::kToolbarButtonHeight) +
++         GetLayoutInsets(LayoutInset::TOOLBAR_INTERIOR_MARGIN).height();
++}
++
+ std::optional<views::ProposedLayout> ToolbarView::CalculateSidebarLayout(
+     const views::SizeBounds& bounds) const {
+   if (!sidebar_mode_ || display_mode_ != DisplayMode::kNormal ||
+@@ -2493,14 +2566,22 @@ void ToolbarView::UpdateSidebarControlsR
+   const auto in_use = [](const ToolbarButton* button) {
+     return button && (button->HasFocus() || button->IsMenuShowing());
+   };
++  // The address bar takes the whole row while it is being edited.
++  const bool editing = location_bar_view_ && location_bar_view_->HasFocus();
+   const bool reveal =
+-      IsCursorInSidebarLocationRow() || in_use(back_) || in_use(forward_) ||
++      sidebar_page_menu_active_ ||
++      (IsCursorInSidebarLocationRow() && !editing) || in_use(back_) ||
++      in_use(forward_) ||
+       (app_menu_button_ &&
+        (app_menu_button_->HasFocus() || app_menu_button_->IsMenuShowing()));
+   if (reveal == sidebar_controls_animation_.IsShowing()) {
+     return;
+   }
+ 
++  // The revealed buttons leave little room, so the page actions make way for
++  // the site while they are showing.
++  UpdateSidebarPageActionsVisibility(/*controls_revealed=*/reveal);
++
+   if (reveal) {
+     sidebar_controls_animation_.Show();
+   } else {
+@@ -2508,6 +2589,75 @@ void ToolbarView::UpdateSidebarControlsR
+   }
+ }
+ 
++void ToolbarView::UpdateSidebarPageActionsVisibility(bool controls_revealed) {
++  if (!location_bar_view_ || !location_bar_view_->page_action_container()) {
++    return;
++  }
++  location_bar_view_->page_action_container()->SetVisible(
++      !controls_revealed &&
++      !base::FeatureList::IsEnabled(features::kHeliumHidePageActions));
++}
++
++void ToolbarView::ShowSidebarPageMenu() {
++  if (!sidebar_mode_ || !app_menu_button_ ||
++      (sidebar_page_menu_runner_ && sidebar_page_menu_runner_->IsRunning())) {
++    return;
++  }
++
++  // The commands run once the menu has closed, so they can open another one.
++  const auto post_to_self = [this](void (ToolbarView::*method)()) {
++    return base::BindRepeating(
++        [](base::WeakPtr<ToolbarView> toolbar, void (ToolbarView::*method)()) {
++          base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++              FROM_HERE, base::BindOnce(method, toolbar));
++        },
++        weak_ptr_factory_.GetWeakPtr(), method);
++  };
++
++  sidebar_page_menu_runner_.reset();
++  sidebar_page_menu_model_ = std::make_unique<SidebarPageMenuModel>(
++      browser_, extensions_container_ != nullptr,
++      post_to_self(&ToolbarView::ShowExtensionsMenuFromSidebar),
++      post_to_self(&ToolbarView::ShowAppMenuFromSidebar));
++  sidebar_page_menu_adapter_ = std::make_unique<views::MenuModelAdapter>(
++      sidebar_page_menu_model_.get(),
++      base::BindRepeating(&ToolbarView::OnSidebarPageMenuClosed,
++                          weak_ptr_factory_.GetWeakPtr()));
++  sidebar_page_menu_runner_ = std::make_unique<views::MenuRunner>(
++      sidebar_page_menu_adapter_->CreateMenu(),
++      views::MenuRunner::HAS_MNEMONICS);
++
++  sidebar_page_menu_active_ = true;
++  UpdateSidebarControlsReveal();
++  sidebar_page_menu_runner_->RunMenuAt(
++      GetWidget(), nullptr, app_menu_button_->GetAnchorBoundsInScreen(),
++      IsVerticalTabsRightAligned() ? views::MenuAnchorPosition::kTopRight
++                                   : views::MenuAnchorPosition::kTopLeft,
++      ui::mojom::MenuSourceType::kNone);
++}
++
++void ToolbarView::OnSidebarPageMenuClosed() {
++  sidebar_page_menu_active_ = false;
++  // A command that opens another menu runs after this, and needs the button
++  // it anchors to.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&ToolbarView::UpdateSidebarControlsReveal,
++                                weak_ptr_factory_.GetWeakPtr()));
++}
++
++void ToolbarView::ShowExtensionsMenuFromSidebar() {
++  if (extensions_container_ && extensions_container_->GetExtensionsButton()) {
++    extensions_container_->GetExtensionsButton()->ToggleExtensionsMenu();
++  }
++}
++
++void ToolbarView::ShowAppMenuFromSidebar() {
++  if (app_menu_button_) {
++    app_menu_button_->ShowMenu(views::MenuRunner::NO_FLAGS);
++    UpdateSidebarControlsReveal();
++  }
++}
++
+ bool ToolbarView::IsCursorInSidebarLocationRow() const {
+   if (!GetWidget() || !location_bar_view_) {
+     return false;
+@@ -2689,6 +2839,12 @@ gfx::Size ToolbarView::GetToolbarButtonS
+ }
+ 
+ views::BubbleAnchor ToolbarView::GetDefaultExtensionDialogAnchor() {
++  // Sidebar mode hides the extensions button, but its container stays put.
++  if (sidebar_mode_ && extensions_container_ &&
++      extensions_container_->IsDrawn()) {
++    return views::BubbleAnchor(extensions_container_);
++  }
++
+   ExtensionsContainerViews* extensions_container =
+       GetExtensionsContainerViews();
+   if (extensions_container && extensions_container->IsVisible()) {
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.h
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.h
+@@ -70,8 +70,14 @@ class OverflowButton;
+ class PerformanceInterventionButton;
+ class TabStripRegionView;
+ 
++namespace ui {
++class SimpleMenuModel;
++}
++
+ namespace views {
+ class FlexLayout;
++class MenuModelAdapter;
++class MenuRunner;
+ class LabelButton;
+ }  // namespace views
+ 
+@@ -195,6 +201,17 @@ class ToolbarView : public views::Access
+   // by the window's caption buttons.
+   void SetSidebarCaptionButtonInsets(int leading, int trailing);
+ 
++  // The height of the first sidebar row, which the caption buttons share.
++  int GetSidebarCaptionRowHeight() const;
++
++  // Shows the short menu for the three-dots button beside the address bar in
++  // sidebar mode.
++  void ShowSidebarPageMenu();
++
++  // Shows the navigation and menu buttons beside the address bar while the
++  // cursor is over its row or one of them is in use.
++  void UpdateSidebarControlsReveal();
++
+   // Resets extension-related toolbar container animations so they don't animate
+   // while zen mode is revealing the toolbar.
+   void AbortToolbarContainerAnimationsForZenReveal();
+@@ -374,10 +391,13 @@ class ToolbarView : public views::Access
+   gfx::Size GetSidebarActionViewSize(const views::View* child,
+                                      const views::SizeBounds& bounds) const;
+ 
+-  // Shows the navigation and menu buttons beside the address bar while the
+-  // cursor is over its row or one of them is in use.
+-  void UpdateSidebarControlsReveal();
+   bool IsCursorInSidebarLocationRow() const;
++  void UpdateSidebarPageActionsVisibility(bool controls_revealed);
++
++  // Handlers for the sidebar page menu.
++  void OnSidebarPageMenuClosed();
++  void ShowExtensionsMenuFromSidebar();
++  void ShowAppMenuFromSidebar();
+ 
+   // AppMenuIconController::Delegate:
+   void UpdateTypeAndSeverity(
+@@ -617,6 +637,15 @@ class ToolbarView : public views::Access
+   bool sidebar_mode_ = false;
+   int sidebar_leading_caption_inset_ = 0;
+   int sidebar_trailing_caption_inset_ = 0;
++
++  // Whether the page menu, or the app menu it is about to open, is keeping
++  // the three-dots button revealed.
++  bool sidebar_page_menu_active_ = false;
++  std::unique_ptr<ui::SimpleMenuModel> sidebar_page_menu_model_;
++  std::unique_ptr<views::MenuModelAdapter> sidebar_page_menu_adapter_;
++  std::unique_ptr<views::MenuRunner> sidebar_page_menu_runner_;
++
++  base::WeakPtrFactory<ToolbarView> weak_ptr_factory_{this};
+ };
+ 
+ extern const ui::ClassProperty<bool>* const kActionItemUnderlineIndicatorKey;
+--- a/chrome/browser/ui/omnibox/BUILD.gn
++++ b/chrome/browser/ui/omnibox/BUILD.gn
+@@ -169,6 +169,7 @@ source_set("impl") {
+       "//chrome/browser/ui/contextual_search",
+       "//chrome/browser/ui/extensions/",
+       "//chrome/browser/ui/hats",
++      "//chrome/browser/ui/helium:helium_layout_state_controller",
+       "//chrome/browser/ui/lens",
+       "//chrome/browser/ui/location_bar",
+       "//chrome/browser/ui/navigator",
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+@@ -66,6 +66,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/hats/hats_service.h"
+ #include "chrome/browser/ui/hats/hats_service_factory.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
+ #include "chrome/browser/ui/layout_constants.h"
+ #include "chrome/browser/ui/lens/lens_search_controller.h"
+ #include "chrome/browser/ui/lens/lens_searchbox_controller.h"
+@@ -265,12 +266,23 @@ ChromeOmniboxClient::~ChromeOmniboxClien
+   }
+ }
+ 
++bool ChromeOmniboxClient::IsMinimalLocationBarEnabled() const {
++  if (GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar)) {
++    return true;
++  }
++
++  // An address bar in the vertical tab strip only has room for the site.
++  auto* layout_controller =
++      browser_ ? HeliumLayoutStateController::From(browser_) : nullptr;
++  return layout_controller && layout_controller->IsSidebarToolbarEnabled();
++}
++
+ bool ChromeOmniboxClient::ShouldUseMinimalLocationBar() const {
+   OmniboxController* omnibox_controller = location_bar_->GetOmniboxController();
+   OmniboxEditModel* edit_model =
+       omnibox_controller ? omnibox_controller->edit_model() : nullptr;
+   return edit_model && edit_model->focus_state() == OMNIBOX_FOCUS_NONE &&
+-         GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar);
++         IsMinimalLocationBarEnabled();
+ }
+ 
+ std::unique_ptr<AutocompleteProviderClient>
+@@ -572,7 +584,7 @@ void ChromeOmniboxClient::OnFocusChanged
+   if (!location_bar_->GetWebContents()) {
+     return;
+   }
+-  if (GetPrefs()->GetBoolean(prefs::kHeliumMinimalLocationBar)) {
++  if (IsMinimalLocationBarEnabled()) {
+     location_bar_->UpdateWithoutTabRestore();
+   }
+   if (auto* helper =
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.h
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+@@ -168,6 +168,7 @@ class ChromeOmniboxClient final : public
+ 
+  private:
+   bool ShouldUseMinimalLocationBar() const;
++  bool IsMinimalLocationBarEnabled() const;
+ 
+   // Performs prerendering for |match|.
+   void DoPrerender(const AutocompleteMatch& match);
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1365,7 +1365,12 @@ ClientFrameElementInfo BrowserView::GetF
+                 ->GetPreferredSize()
+                 .height()
+           : 0;
+-  if (toolbar_ && ShouldDrawVerticalTabStrip()) {
++  if (toolbar_ && toolbar_->is_sidebar_mode()) {
++    // The frame centers its caption buttons within this height, so make it
++    // match the toolbar's first row, wherever the tab strip has put it.
++    info.toolbar_minimum_height = toolbar_->GetSidebarCaptionRowHeight() +
++                                  2 * GetSidebarToolbarTopOffset();
++  } else if (toolbar_ && ShouldDrawVerticalTabStrip()) {
+     info.toolbar_minimum_height = toolbar_->GetMinimumSize().height();
+   } else if (web_app_frame_toolbar_ && ShouldDrawWebAppFrameToolbar()) {
+     info.toolbar_minimum_height =
+@@ -1848,6 +1853,34 @@ void BrowserView::OnToolbarTabStripState
+   InvalidateLayout();
+ }
+ 
++int BrowserView::GetSidebarToolbarTopOffset() const {
++  if (!toolbar_ || !toolbar_->is_sidebar_mode()) {
++    return 0;
++  }
++  gfx::Point toolbar_origin;
++  views::View::ConvertPointToTarget(toolbar_, this, &toolbar_origin);
++  return std::max(0, toolbar_origin.y());
++}
++
++void BrowserView::UpdateCaptionButtonsForSidebarToolbar() {
++  const int top_offset = GetSidebarToolbarTopOffset();
++  if (sidebar_toolbar_top_offset_ == top_offset) {
++    return;
++  }
++  sidebar_toolbar_top_offset_ = top_offset;
++
++  // The frame only repositions the caption buttons when asked to.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(
++                     [](base::WeakPtr<BrowserView> browser_view) {
++                       if (browser_view && browser_view->GetWidget() &&
++                           browser_view->GetFrameView()) {
++                         browser_view->GetFrameView()->OnTabStripStateChanged();
++                       }
++                     },
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
+ void BrowserView::UpdateSidebarToolbarAttachment() {
+   if (!toolbar_ || !top_container_ || !vertical_tab_strip_region_view_) {
+     return;
+@@ -2066,7 +2099,10 @@ void BrowserView::UpdateZenModeState() {
+ }
+ 
+ void BrowserView::UpdateZenModeEventMonitor() {
+-  if (!GetWidget() || !(IsZenModeEnabled() || IsSidebarToolbarHidden())) {
++  // A toolbar hosted in the vertical tab strip also follows the cursor, to
++  // reveal its controls. Views only reports the cursor entering and leaving
++  // its views, and not reliably while the tab strip floats over the page.
++  if (!GetWidget() || !(IsZenModeEnabled() || IsSidebarToolbarMode())) {
+     zen_mode_event_monitor_.reset();
+     return;
+   }
+@@ -5760,6 +5796,8 @@ void BrowserView::Layout(PassKey) {
+         .Then(&OmniboxPopupViewBrowserView::UpdateLayout);
+   }
+ 
++  UpdateCaptionButtonsForSidebarToolbar();
++
+   // Some of the situations when the BrowserView is laid out are:
+   // - Enter/exit immersive fullscreen mode.
+   // - Enter/exit tablet mode.
+@@ -6979,13 +7017,22 @@ void BrowserView::OnWillChangeFocus(View
+ }
+ void BrowserView::OnDidChangeFocus(View* focused_before, View* focused_now) {
+   UpdateAccessibleNameForRootView();
++  if (toolbar_) {
++    toolbar_->UpdateSidebarControlsReveal();
++  }
+   if (IsChromeAutoHideActive()) {
+     UpdateZenModeRevealFromCursor();
+   }
+ }
+ 
+ void BrowserView::OnEvent(const ui::Event& event) {
+-  if (!IsChromeAutoHideActive() || !event.IsMouseEvent()) {
++  if (!event.IsMouseEvent()) {
++    return;
++  }
++  if (toolbar_) {
++    toolbar_->UpdateSidebarControlsReveal();
++  }
++  if (!IsChromeAutoHideActive()) {
+     return;
+   }
+   // Mouse exit events can also come from internal view transitions. Only use
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -952,6 +952,11 @@ class BrowserView : public BrowserWindow
+   // Moves the toolbar between the top container and the vertical tab strip.
+   void UpdateSidebarToolbarAttachment();
+ 
++  // The distance from the top of the window to a toolbar hosted in the
++  // vertical tab strip, and a nudge for the frame when it changes.
++  int GetSidebarToolbarTopOffset() const;
++  void UpdateCaptionButtonsForSidebarToolbar();
++
+   // Zen mode helpers.
+   void OnZenModeSideChromePinnedPrefChanged();
+   void OnZenModeTopChromePinnedPrefChanged();
+@@ -1269,6 +1274,7 @@ class BrowserView : public BrowserWindow
+   // The toolbar's index in the top container while it is hosted in the
+   // vertical tab strip.
+   std::optional<size_t> toolbar_top_container_index_;
++  int sidebar_toolbar_top_offset_ = 0;
+ 
+   // Whether the vertical tab strip that hosts the toolbar is hidden.
+   bool sidebar_toolbar_hidden_ = false;
+--- a/chrome/browser/ui/views/toolbar/app_menu.cc
++++ b/chrome/browser/ui/views/toolbar/app_menu.cc
+@@ -1064,9 +1064,18 @@ void AppMenu::RunMenu(views::MenuButtonC
+   UMA_HISTOGRAM_ENUMERATION("WrenchMenu.MenuAction", MENU_ACTION_MENU_OPENED,
+                             LIMIT_MENU_ACTION);
+ 
+-  menu_runner_->RunMenuAt(host->button()->GetWidget(), host,
+-                          host->button()->GetAnchorBoundsInScreen(),
+-                          views::MenuAnchorPosition::kTopRight, source_type,
++  // A button in the leading half of the window, as in the vertical tab strip,
++  // opens its menu towards the rest of the window.
++  const gfx::Rect anchor_bounds = host->button()->GetAnchorBoundsInScreen();
++  const gfx::Rect window_bounds =
++      host->button()->GetWidget()->GetWindowBoundsInScreen();
++  const views::MenuAnchorPosition anchor_position =
++      anchor_bounds.CenterPoint().x() < window_bounds.CenterPoint().x()
++          ? views::MenuAnchorPosition::kTopLeft
++          : views::MenuAnchorPosition::kTopRight;
++
++  menu_runner_->RunMenuAt(host->button()->GetWidget(), host, anchor_bounds,
++                          anchor_position, source_type,
+                           /*native_view_for_gestures=*/gfx::NativeView(),
+                           /*corners=*/std::nullopt,
+                           "Chrome.AppMenu.MenuHostInitToNextFramePresented");

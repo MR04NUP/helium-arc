@@ -354,6 +354,16 @@ helium/ui/layout/zen-mode-wiring.patch
 helium/ui/layout/zen-caption-buttons.patch
 helium/ui/layout/zen-mode.patch
 helium/ui/layout/min-window-width.patch
+helium/ui/layout/sidebar-toolbar-wiring.patch
+helium/ui/layout/sidebar-toolbar.patch
+helium/ui/layout/sidebar-toolbar-autohide.patch
+helium/ui/layout/sidebar-toolbar-controls.patch
+helium/ui/layout/sidebar-toolbar-omnibox-popup.patch
+helium/ui/layout/sidebar-toolbar-downloads.patch
+helium/ui/layout/vertical-pinned-tab-tiles.patch
+helium/ui/layout/sidebar-toolbar-window-edges.patch
+helium/ui/layout/sidebar-toolbar-fullscreen-controls.patch
+helium/ui/layout/sidebar-toolbar-floating-geometry.patch
 
 helium/ui/generate-standard-qr-codes.patch
 helium/ui/pdf-viewer.patch

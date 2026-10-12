@@ -1,0 +1,256 @@
+--- a/chrome/browser/ui/views/frame/browser_frame_view.h
++++ b/chrome/browser/ui/views/frame/browser_frame_view.h
+@@ -158,6 +158,10 @@ class BrowserFrameView : public views::F
+   // frame. Mainly used by special browsers such as PWAs.
+   virtual void UpdateThrobber(bool running) = 0;
+ 
++  // Moves the caption buttons away from the leading edge of the window, to
++  // keep them over chrome that floats away from that edge.
++  virtual void SetCaptionButtonsLeadingOffset(int offset) {}
++
+   // Sets the rendering opacity of caption buttons (0 = invisible, 1 = fully
+   // visible).  Used by zen mode to fade buttons with the toolbar while keeping
+   // them in the layout for exclusion area calculations.
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.h
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.h
+@@ -60,6 +60,7 @@ class BrowserFrameViewMac : public Brows
+   gfx::Rect GetWindowBoundsForClientBounds(
+       const gfx::Rect& client_bounds) const override;
+   int NonClientHitTest(const gfx::Point& point) override;
++  void SetCaptionButtonsLeadingOffset(int offset) override;
+   void UpdateMinimumSize() override;
+   void WindowControlsOverlayEnabledChanged() override;
+   void SetCaptionButtonsOpacity(float opacity) override;
+@@ -117,6 +118,9 @@ class BrowserFrameViewMac : public Brows
+   raw_ptr<CaptionButtonPlaceholderContainer>
+       caption_button_placeholder_container_ = nullptr;
+ 
++  // How far the caption buttons are moved from their usual place.
++  int caption_buttons_leading_offset_ = 0;
++
+   FullscreenToolbarController* __strong fullscreen_toolbar_controller_;
+ 
+   // Mark the start of a fullscreen session. Applies to both immersive and
+--- a/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
++++ b/chrome/browser/ui/views/frame/browser_frame_view_mac.mm
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <vector>
+ 
++#include "base/apple/foundation_util.h"
+ #include "base/command_line.h"
+ #include "base/containers/fixed_flat_map.h"
+ #include "base/functional/bind.h"
+@@ -49,6 +50,7 @@
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/common/pref_names.h"
+ #include "components/prefs/pref_service.h"
++#import "components/remote_cocoa/app_shim/browser_native_widget_window_mac.h"
+ #include "components/remote_cocoa/common/native_widget_ns_window.mojom.h"
+ #include "ui/base/hit_test.h"
+ #include "ui/base/theme_provider.h"
+@@ -363,6 +365,19 @@ gfx::RoundedCornersF BrowserFrameViewMac
+   return gfx::RoundedCornersF();
+ }
+ 
++void BrowserFrameViewMac::SetCaptionButtonsLeadingOffset(int offset) {
++  if (caption_buttons_leading_offset_ == offset) {
++    return;
++  }
++  caption_buttons_leading_offset_ = offset;
++
++  // Only normal browser windows have their `NSWindow` in this process.
++  NSWindow* window = GetWidget()->GetNativeWindow().GetNativeNSWindow();
++  [base::apple::ObjCCast<BrowserNativeWidgetWindow>(window)
++      setTrafficLightsLeadingOffset:offset];
++  InvalidateLayout();
++}
++
+ void BrowserFrameViewMac::SetCaptionButtonsOpacity(float opacity) {
+   NSWindow* window = GetWidget()->GetNativeWindow().GetNativeNSWindow();
+   if (!window) {
+@@ -493,6 +508,8 @@ BrowserFrameViewMac::GetCaptionButtonBou
+   }
+   // LINT.ThenChange(//chrome/browser/ui/views/frame/immersive_mode_controller_mac.mm:MacTabStripInsets)
+ 
++  result.bounds.Offset(caption_buttons_leading_offset_, 0);
++
+   // Mirror for when caption buttons are on the "wrong" side.
+   if (!CaptionButtonsOnLeadingEdge()) {
+     result.bounds.set_x(width() - (result.bounds.x() + result.bounds.width()));
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1863,23 +1863,42 @@ int BrowserView::GetSidebarToolbarTopOff
+   return std::max(0, toolbar_origin.y());
+ }
+ 
++int BrowserView::GetSidebarToolbarLeadingOffset() const {
++  // The caption buttons are only over a tab strip on their side of the window.
++  if (!toolbar_ || !toolbar_->is_sidebar_mode() ||
++      !vertical_tab_strip_region_view_ || IsVerticalTabStripRightAligned()) {
++    return 0;
++  }
++  return vertical_tab_strip_region_view_->window_edge_inset();
++}
++
+ void BrowserView::UpdateCaptionButtonsForSidebarToolbar() {
+   const int top_offset = GetSidebarToolbarTopOffset();
+-  if (sidebar_toolbar_top_offset_ == top_offset) {
++  const int leading_offset = GetSidebarToolbarLeadingOffset();
++  if (sidebar_toolbar_top_offset_ == top_offset &&
++      sidebar_toolbar_leading_offset_ == leading_offset) {
+     return;
+   }
+   sidebar_toolbar_top_offset_ = top_offset;
++  sidebar_toolbar_leading_offset_ = leading_offset;
+ 
+   // The frame only repositions the caption buttons when asked to.
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+-      FROM_HERE, base::BindOnce(
+-                     [](base::WeakPtr<BrowserView> browser_view) {
+-                       if (browser_view && browser_view->GetWidget() &&
+-                           browser_view->GetFrameView()) {
+-                         browser_view->GetFrameView()->OnTabStripStateChanged();
+-                       }
+-                     },
+-                     weak_ptr_factory_.GetWeakPtr()));
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<BrowserView> browser_view) {
++            if (!browser_view || !browser_view->GetWidget() ||
++                !browser_view->GetFrameView()) {
++              return;
++            }
++            auto* const frame_view = browser_view->GetFrameView();
++            frame_view->SetCaptionButtonsLeadingOffset(
++                browser_view->sidebar_toolbar_leading_offset_);
++            frame_view->OnTabStripStateChanged();
++            // The toolbar's first row makes room for the buttons.
++            browser_view->InvalidateLayout();
++          },
++          weak_ptr_factory_.GetWeakPtr()));
+ }
+ 
+ void BrowserView::UpdateSidebarToolbarAttachment() {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -961,9 +961,11 @@ class BrowserView : public BrowserWindow
+   // Moves the toolbar between the top container and the vertical tab strip.
+   void UpdateSidebarToolbarAttachment();
+ 
+-  // The distance from the top of the window to a toolbar hosted in the
+-  // vertical tab strip, and a nudge for the frame when it changes.
++  // The distances from the top and leading edges of the window to a toolbar
++  // hosted in the vertical tab strip, and a nudge for the frame when they
++  // change.
+   int GetSidebarToolbarTopOffset() const;
++  int GetSidebarToolbarLeadingOffset() const;
+   void UpdateCaptionButtonsForSidebarToolbar();
+ 
+   // Zen mode helpers.
+@@ -1284,6 +1286,7 @@ class BrowserView : public BrowserWindow
+   // vertical tab strip.
+   std::optional<size_t> toolbar_top_container_index_;
+   int sidebar_toolbar_top_offset_ = 0;
++  int sidebar_toolbar_leading_offset_ = 0;
+ 
+   // Whether the vertical tab strip that hosts the toolbar is hidden.
+   bool sidebar_toolbar_hidden_ = false;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -1331,9 +1331,15 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   // especially obvious in split view, where turning the separator off provides
+   // the required top padding.
+   const auto& separator_info = layout_data_->separator_info;
++  // With the toolbar in the vertical tab strip there may be nothing left above
++  // the contents, in which case their top edge is the window's and is inset
++  // and rounded like the other edges.
++  const bool contents_at_window_top =
++      toolbar_in_vertical_tab_strip && !infobar_visible &&
++      params.visual_client_area.y() <= browser_params.visual_client_area.y();
+   views().multi_contents_view->SetTopChromeAttachmentState(
+       infobar_visible && should_use_rounded_frame,
+-      separator_info.multi_contents_separator &&
++      separator_info.multi_contents_separator && !contents_at_window_top &&
+           (infobar_visible || !zen.enabled || zen.TopChromeVisible()));
+ 
+   // Updating the top, left and right insets for contents container view when
+@@ -1525,6 +1531,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+         has_leading_exclusion);
+     views().vertical_tab_strip_region_view->SetZenModeFloatingStyleForLayout(
+         zen.floating_vertical_tab_strip);
++    views().vertical_tab_strip_region_view->SetWindowEdgeInsetForLayout(
++        zen.vertical_tab_strip_padding);
+   }
+ 
+   if (IsParentedTo(views().side_panel_content_transition_scrim,
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -91,6 +91,11 @@ class VerticalTabStripRegionView final
+   void SetHasLeadingExclusionForLayout(bool has_leading_exclusion);
+   void SetZenModeFloatingStyleForLayout(bool floating);
+ 
++  // The gap left between the window's edge and the tab strip while it floats
++  // over the contents, wherever it currently is in sliding into view.
++  void SetWindowEdgeInsetForLayout(int inset) { window_edge_inset_ = inset; }
++  int window_edge_inset() const { return window_edge_inset_; }
++
+   // Hosts the toolbar above the tabs, or hands it back to the caller.
+   void AttachToolbar(std::unique_ptr<ToolbarView> toolbar);
+   std::unique_ptr<ToolbarView> DetachToolbar();
+@@ -246,6 +251,7 @@ class VerticalTabStripRegionView final
+   // Whether a leading exclusion exists due to window controls.
+   bool has_leading_exclusion_ = false;
+   bool zen_mode_floating_style_ = false;
++  int window_edge_inset_ = 0;
+ 
+   // The toolbar, while it is hosted above the tabs.
+   raw_ptr<ToolbarView> hosted_toolbar_ = nullptr;
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.h
+@@ -9,6 +9,10 @@
+ 
+ REMOTE_COCOA_APP_SHIM_EXPORT
+ @interface BrowserNativeWidgetWindow : NativeWidgetMacNSWindow
++// Moves the traffic lights `offset` further from the leading edge of the
++// window. Takes effect the next time the titlebar is laid out.
++- (void)setTrafficLightsLeadingOffset:(CGFloat)offset;
++
+ // When set to `YES`, the traffic lights will always be shown. When set to `NO`,
+ // the traffic lights follow the default AppKit behavior.
+ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow;
+--- a/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
++++ b/components/remote_cocoa/app_shim/browser_native_widget_window_mac.mm
+@@ -38,6 +38,7 @@ WEAK_IMPORT_ATTRIBUTE
+ @implementation BrowserWindowFrame {
+   BOOL _inFullScreen;
+   BOOL _alwaysShowTrafficLights;
++  CGFloat _trafficLightsLeadingOffset;
+ }
+ 
+ // NSThemeFrame overrides.
+@@ -72,7 +73,11 @@ WEAK_IMPORT_ATTRIBUTE
+   // Both macOS 15- and macOS 26+ use the same inset here, but
+   // 1px is invisible on macOS 15- for some reason. Ideally it should be 11px here,
+   // but since it appears visually to be 11, we just use 10 here for both styles.
+-  return 10.0;
++  return 10.0 + _trafficLightsLeadingOffset;
++}
++
++- (void)setTrafficLightsLeadingOffset:(CGFloat)offset {
++  _trafficLightsLeadingOffset = offset;
+ }
+ 
+ // Override -_getCachedWindowCornerRadius rather than -_cornerRadius because the
+@@ -212,6 +217,11 @@ WEAK_IMPORT_ATTRIBUTE
+     bridge->host()->OnFocusWindowToolbar();
+ }
+ 
++- (void)setTrafficLightsLeadingOffset:(CGFloat)offset {
++  [base::apple::ObjCCastStrict<BrowserWindowFrame>(self.contentView.superview)
++      setTrafficLightsLeadingOffset:offset];
++}
++
+ - (void)setAlwaysShowTrafficLights:(BOOL)alwaysShow {
+   [base::apple::ObjCCastStrict<BrowserWindowFrame>(self.contentView.superview)
+       setAlwaysShowTrafficLights:alwaysShow];

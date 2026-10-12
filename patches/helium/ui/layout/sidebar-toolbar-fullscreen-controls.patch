@@ -1,0 +1,113 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1000,7 +1000,8 @@ BrowserView::BrowserView(BrowserWindowIn
+           std::make_unique<ExclusiveAccessContextImpl>(*this)),
+       browser_(browser),
+       zen_top_chrome_animation_(this),
+-      zen_side_chrome_animation_(this) {
++      zen_side_chrome_animation_(this),
++      fullscreen_caption_buttons_animation_(this) {
+   if (auto* manager = InitialWebUIWindowMetricsManager::From(browser_.get())) {
+     manager->OnBrowserWindowCreated();
+   }
+@@ -1047,6 +1048,8 @@ BrowserView::BrowserView(BrowserWindowIn
+       gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+   zen_side_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
+   zen_side_chrome_animation_.Reset(1);
++  fullscreen_caption_buttons_animation_.SetSlideDuration(
++      gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+ 
+   browser_->GetTabStripModel()->AddObserver(this);
+ 
+@@ -2090,6 +2093,45 @@ void BrowserView::UpdateCaptionButtonsFo
+ #endif  // BUILDFLAG(IS_MAC)
+ }
+ 
++void BrowserView::UpdateCaptionButtonsForFullscreen() {
++#if BUILDFLAG(IS_MAC)
++  auto* const frame_view = GetFrameView();
++  if (!frame_view) {
++    return;
++  }
++
++  // A fullscreen window has no titlebar to keep the caption buttons in, so
++  // those in a toolbar hosted in the vertical tab strip stay out of the way
++  // until the cursor reaches the top of the window.
++  if (!IsSidebarToolbarMode() || !IsFullscreen() || !IsToolbarVisible()) {
++    if (fullscreen_caption_buttons_hidden_) {
++      fullscreen_caption_buttons_hidden_ = false;
++      fullscreen_caption_buttons_animation_.Reset(0);
++      frame_view->SetCaptionButtonsOpacity(GetTopChromeRevealRatio());
++      UpdateCaptionButtonsForSideChrome();
++    }
++    return;
++  }
++  fullscreen_caption_buttons_hidden_ = true;
++
++  gfx::Point cursor;
++  const bool reveal =
++      GetCursorLocationInBrowserView(&cursor) &&
++      GetLocalBounds().Contains(cursor) &&
++      cursor.y() < GetSidebarToolbarTopOffset() +
++                       toolbar_->GetSidebarCaptionRowHeight();
++  if (reveal != fullscreen_caption_buttons_animation_.IsShowing()) {
++    if (reveal) {
++      fullscreen_caption_buttons_animation_.Show();
++    } else {
++      fullscreen_caption_buttons_animation_.Hide();
++    }
++  }
++  frame_view->SetCaptionButtonsOpacity(
++      fullscreen_caption_buttons_animation_.GetCurrentValue());
++#endif  // BUILDFLAG(IS_MAC)
++}
++
+ void BrowserView::UpdateZenModeState() {
+   const bool zen_mode_enabled = IsZenModeEnabled();
+   UpdateSidebarToolbarHiddenState();
+@@ -5865,6 +5907,7 @@ void BrowserView::Layout(PassKey) {
+   }
+ 
+   UpdateCaptionButtonsForSidebarToolbar();
++  UpdateCaptionButtonsForFullscreen();
+ 
+   // Some of the situations when the BrowserView is laid out are:
+   // - Enter/exit immersive fullscreen mode.
+@@ -7100,6 +7143,7 @@ void BrowserView::OnEvent(const ui::Even
+   if (toolbar_) {
+     toolbar_->UpdateSidebarControlsReveal();
+   }
++  UpdateCaptionButtonsForFullscreen();
+   if (!IsChromeAutoHideActive()) {
+     return;
+   }
+@@ -7143,6 +7187,7 @@ void BrowserView::AnimationProgressed(co
+       }
+     }
+   }
++  UpdateCaptionButtonsForFullscreen();
+ }
+ 
+ void BrowserView::AnimationEnded(const gfx::Animation* animation) {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -988,6 +988,10 @@ class BrowserView : public BrowserWindow
+   void UpdateSidebarToolbarHiddenState();
+   void RevealSideChromeImmediately();
+   void UpdateCaptionButtonsForSideChrome();
++
++  // Shows the caption buttons of a fullscreen window whose toolbar is hosted
++  // in the vertical tab strip only while the cursor is at its top.
++  void UpdateCaptionButtonsForFullscreen();
+   bool HasOpenBubbleFromVerticalTabStrip() const;
+   bool IsZenModeEnabled() const;
+   bool IsPointInZenTopTrigger(const gfx::Point& point) const;
+@@ -1540,6 +1544,8 @@ class BrowserView : public BrowserWindow
+   std::unique_ptr<views::EventMonitor> zen_mode_event_monitor_;
+   gfx::SlideAnimation zen_top_chrome_animation_;
+   gfx::SlideAnimation zen_side_chrome_animation_;
++  gfx::SlideAnimation fullscreen_caption_buttons_animation_;
++  bool fullscreen_caption_buttons_hidden_ = false;
+   base::OneShotTimer zen_cursor_exit_timer_;
+   std::optional<gfx::Point> zen_last_cursor_;
+   bool zen_mode_enabled_ = false;

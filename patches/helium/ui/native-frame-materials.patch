@@ -79,7 +79,7 @@
    registry->RegisterBooleanPref(prefs::kHeliumMinimalLocationBar, false);
 --- a/chrome/browser/extensions/api/settings_private/prefs_util.cc
 +++ b/chrome/browser/extensions/api/settings_private/prefs_util.cc
-@@ -233,6 +233,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
+@@ -235,6 +235,8 @@ const PrefsUtil::TypedPrefMap& PrefsUtil
        settings_api::PrefType::kBoolean;
    (*s_allowlist)[::prefs::kHeliumZenModeTopChromePinned] =
        settings_api::PrefType::kBoolean;
@@ -115,7 +115,7 @@
        {"browserLayout", IDS_SETTINGS_BROWSER_LAYOUT},
        {"browserLayoutClassic", IDS_SETTINGS_BROWSER_LAYOUT_CLASSIC},
        {"browserLayoutDynamic", IDS_SETTINGS_BROWSER_LAYOUT_DYNAMIC},
-@@ -704,6 +707,8 @@ void AddAppearanceStrings(content::WebUI
+@@ -705,6 +708,8 @@ void AddAppearanceStrings(content::WebUI
        "showEverythingMenuEnabled",
        tab_groups::SavedTabGroupUtils::IsEnabledForProfile(profile));
  
@@ -145,7 +145,7 @@
    protected accessor ntpSimplificationBookmarksBarEnabled_: boolean =
 --- a/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
 +++ b/chrome/browser/resources/settings/appearance_page/appearance_page.html.ts
-@@ -113,6 +113,12 @@ export function getHtml(this: SettingsAp
+@@ -118,6 +118,12 @@ export function getHtml(this: SettingsAp
          pref-key="helium.browser.rounded_frame"
          label="$i18n{roundedFrame}">
      </settings-toggle-button>
@@ -1364,7 +1364,7 @@
      CHECK(!view->layer()->fills_bounds_opaquely());
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
-@@ -333,6 +333,7 @@ void VerticalTabStripRegionView::SetZenM
+@@ -342,6 +342,7 @@ void VerticalTabStripRegionView::SetZenM
  
    background->SetCorners(corners);
    background->SetOutline(outline);

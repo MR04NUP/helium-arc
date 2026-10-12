@@ -1,0 +1,173 @@
+--- a/chrome/browser/ui/layout_constants.cc
++++ b/chrome/browser/ui/layout_constants.cc
+@@ -153,7 +153,7 @@ int GetLayoutConstant(LayoutConstant con
+     case LayoutConstant::kVerticalTabHeight:
+       return 30;
+     case LayoutConstant::kVerticalTabPinnedHeight:
+-      return 30;
++      return 40;
+     case LayoutConstant::kVerticalTabMinWidth:
+       return 30;
+     case LayoutConstant::kVerticalTabStripHorizontalPadding:
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -28,6 +28,11 @@
+ 
+ namespace {
+ constexpr int kTabPadding = 4;
++
++// Expanded vertical pinned tabs are shown as a grid of tiles, which are larger
++// and further apart than the tabs of a collapsed tab strip.
++constexpr int kTilePadding = 8;
++constexpr int kTileMinWidth = 48;
+ }  // namespace
+ 
+ PinnedTabContainerView::PinnedTabContainerView(
+@@ -122,9 +127,12 @@ gfx::Size PinnedTabContainerView::GetMin
+                                                                         : 1.0f),
+       static_cast<float>(num_children));
+   const int min_height =
+-      base::ClampCeil(GetLayoutConstant(LayoutConstant::kVerticalTabHeight) *
+-                      min_rows) +
+-      (num_children > 1 ? kTabPadding : 0);
++      base::ClampCeil(
++          GetLayoutConstant(ShouldUseTiles()
++                                ? LayoutConstant::kVerticalTabPinnedHeight
++                                : LayoutConstant::kVerticalTabHeight) *
++          min_rows) +
++      (num_children > 1 ? GetVerticalTabPadding() : 0);
+   return gfx::Size(GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth),
+                    min_height);
+ }
+@@ -190,7 +198,7 @@ PinnedTabContainerView::GetLinkDropIndex
+     const gfx::Point& loc_in_container) {
+   const bool is_vertical =
+       collection_node_->orientation() == TabStripOrientation::kVertical;
+-  const int padding = is_vertical ? kTabPadding : 0;
++  const int padding = is_vertical ? GetVerticalTabPadding() : 0;
+   const int logical_x = GetMirroredXInView(loc_in_container.x());
+ 
+   for (auto& child_node : collection_node_->children()) {
+@@ -290,6 +298,17 @@ PinnedTabContainerView::GetLinkDropIndex
+   return GetLinkDropIndexForHorizontal(loc_in_container);
+ }
+ 
++bool PinnedTabContainerView::ShouldUseTiles() const {
++  return collection_node_ &&
++         collection_node_->orientation() == TabStripOrientation::kVertical &&
++         GetTabStripCollapseState() ==
++             tabs::VerticalTabStripCollapseState::kExpanded;
++}
++
++int PinnedTabContainerView::GetVerticalTabPadding() const {
++  return ShouldUseTiles() ? kTilePadding : kTabPadding;
++}
++
+ void PinnedTabContainerView::ResetCollectionNode() {
+   collapsed_state_changed_subscription_ = {};
+   collection_node_ = nullptr;
+@@ -396,8 +415,12 @@ views::ProposedLayout PinnedTabContainer
+       contains_split = true;
+     }
+   }
+-  int child_width = GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth) *
+-                    (contains_split ? 2 : 1);
++  const int tab_padding = GetVerticalTabPadding();
++  int child_width =
++      (ShouldUseTiles()
++           ? kTileMinWidth
++           : GetLayoutConstant(LayoutConstant::kVerticalTabMinWidth)) *
++      (contains_split ? 2 : 1);
+ 
+   // If the width is bounded, calculate how many children can fit on a row.
+   // Since all children are allocated the same width this will be the same for
+@@ -415,12 +438,12 @@ views::ProposedLayout PinnedTabContainer
+         1,
+         std::min(children_on_row,
+                  static_cast<int>(std::floor((available_width - child_width) /
+-                                             (child_width + kTabPadding)) +
++                                             (child_width + tab_padding)) +
+                                   1)));
+ 
+     // Allocate extra space to the tabs.
+     available_width -=
+-        (children_on_row * child_width) + (kTabPadding * (children_on_row - 1));
++        (children_on_row * child_width) + (tab_padding * (children_on_row - 1));
+     child_width += std::floor(available_width / children_on_row);
+   }
+ 
+@@ -445,12 +468,12 @@ views::ProposedLayout PinnedTabContainer
+     bounds.set_x(child_x);
+ 
+     if (row_index != 0) {
+-      bounds.set_x(bounds.x() + kTabPadding);
++      bounds.set_x(bounds.x() + tab_padding);
+     }
+ 
+     if (!drag_data || !drag_data->should_float) {
+       if (row_index != 0) {
+-        x += kTabPadding;
++        x += tab_padding;
+       }
+       x += bounds.width();
+       total_width = std::max(total_width, x);
+@@ -458,7 +481,7 @@ views::ProposedLayout PinnedTabContainer
+ 
+       row_index++;
+       if (row_index >= children_on_row) {
+-        y = total_height + kTabPadding;
++        y = total_height + tab_padding;
+         row_index = 0;
+         x = 0;
+       }
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.h
+@@ -77,6 +77,11 @@ class PinnedTabContainerView
+   std::optional<BrowserRootView::DropIndex> GetLinkDropIndexForExpanded(
+       const gfx::Point& loc_in_container);
+ 
++  // Returns whether the tabs are shown as a grid of tiles, which is the case
++  // in an expanded vertical tab strip, and the space to leave between them.
++  bool ShouldUseTiles() const;
++  int GetVerticalTabPadding() const;
++
+   void ResetCollectionNode();
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
+--- a/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_view_vertical_layout.cc
+@@ -49,9 +49,11 @@ views::ProposedLayout TabViewVerticalLay
+     const views::SizeBounds& size_bounds) const {
+   const int width = size_bounds.width().value_or(
+       VerticalTabStripRegionView::kUncollapsedMaxWidth);
++  // Pinned tabs are only shown as tiles while the tab strip is expanded.
+   const int height = GetLayoutConstant(
+-      TabView().pinned_ ? LayoutConstant::kVerticalTabPinnedHeight
+-                        : LayoutConstant::kVerticalTabHeight);
++      TabView().pinned_ && !TabView().collapsed_
++          ? LayoutConstant::kVerticalTabPinnedHeight
++          : LayoutConstant::kVerticalTabHeight);
+   views::ProposedLayout layouts;
+   layouts.host_size = gfx::Size(width, height);
+ 
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -212,6 +212,9 @@ constexpr int kDynamicNewTabButtonIconSi
+ 
+ // Sidebar mode stacks the pinned actions above the address bar.
+ constexpr int kSidebarToolbarRowGap = 4;
++// The gap below the address bar matches the one between the pinned tabs that
++// follow it.
++constexpr int kSidebarToolbarBottomGap = 8;
+ constexpr int kSidebarToolbarDefaultWidth = 200;
+ constexpr base::TimeDelta kSidebarControlsRevealDuration =
+     base::Milliseconds(150);
+@@ -2418,7 +2421,7 @@ std::optional<views::ProposedLayout> Too
+ 
+   views::ProposedLayout layout;
+   layout.host_size =
+-      gfx::Size(width, location_y + row_height + margin.bottom());
++      gfx::Size(width, location_y + row_height + kSidebarToolbarBottomGap);
+ 
+   const auto can_show = [this](const views::View* view) {
+     return view && layout_manager_->CanBeVisible(view);

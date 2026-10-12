@@ -1,0 +1,134 @@
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -128,7 +128,8 @@ gfx::Rect SlideBoundsFromSide(const gfx:
+ 
+ ZenModeLayoutState GetZenModeLayoutState(
+     const BrowserViewLayoutDelegate& delegate,
+-    bool vertical_tab_strip_active) {
++    bool vertical_tab_strip_active,
++    bool toolbar_in_vertical_tab_strip) {
+   ZenModeLayoutState state;
+   state.enabled = delegate.IsZenModeEnabledForLayout();
+   // A hidden tab strip that hosts the toolbar floats in the same way as an
+@@ -142,7 +143,9 @@ ZenModeLayoutState GetZenModeLayoutState
+   state.top_chrome_ratio = delegate.GetTopChromeRevealRatio();
+   state.side_chrome_ratio = delegate.GetSideChromeRevealRatio();
+ 
+-  if (!state.floating_vertical_tab_strip) {
++  // A tab strip that hosts the toolbar stays where it is docked, so that
++  // nothing in it moves when it starts to float.
++  if (!state.floating_vertical_tab_strip || toolbar_in_vertical_tab_strip) {
+     return state;
+   }
+ 
+@@ -874,7 +877,8 @@ BrowserViewTabbedLayoutImpl::CalculatePr
+   const bool show_dynamic_tab_strip =
+       ShowDynamicTabStrip(layout_data_->tab_strip_type);
+   const ZenModeLayoutState zen = GetZenModeLayoutState(
+-      delegate(), layout_data_->tab_strip_type == TabStripType::kVertical);
++      delegate(), layout_data_->tab_strip_type == TabStripType::kVertical,
++      IsToolbarInVerticalTabStrip());
+   std::optional<int> dynamic_tab_strip_top;
+   const HorizontalLayout& horizontal_layout = layout_data_->horizontal_layout;
+   const bool infobar_visible = delegate().IsInfobarVisible();
+@@ -1583,7 +1587,8 @@ gfx::Rect BrowserViewTabbedLayoutImpl::C
+   const bool show_dynamic_tab_strip =
+       ShowDynamicTabStrip(layout_data_->tab_strip_type);
+   const ZenModeLayoutState zen = GetZenModeLayoutState(
+-      delegate(), layout_data_->tab_strip_type == TabStripType::kVertical);
++      delegate(), layout_data_->tab_strip_type == TabStripType::kVertical,
++      IsToolbarInVerticalTabStrip());
+ 
+   if (IsParentedTo(views().horizontal_tab_strip_region_view,
+                    views().top_container)) {
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -314,6 +314,14 @@ void VerticalTabStripRegionView::SetZenM
+   zen_mode_floating_style_ = floating;
+   UpdateResizeAreaVisibility();
+   SetClipLayerToVisibleBounds(floating);
++  UpdateFloatingStyle();
++}
++
++bool VerticalTabStripRegionView::IsFloatingCard() const {
++  return zen_mode_floating_style_ && !hosted_toolbar_;
++}
++
++void VerticalTabStripRegionView::UpdateFloatingStyle() {
+   UpdateInteriorMargin();
+ 
+   auto* const background =
+@@ -324,7 +332,7 @@ void VerticalTabStripRegionView::SetZenM
+ 
+   CustomCornersBackground::Corners corners;
+   CustomCornersBackground::Outline outline;
+-  if (floating) {
++  if (IsFloatingCard()) {
+     CustomCornersBackground::Corner rounded_corner;
+     rounded_corner.type = CustomCornersBackground::CornerType::kRounded;
+     rounded_corner.radius = GetGenericFrameRadius();
+@@ -338,11 +346,18 @@ void VerticalTabStripRegionView::SetZenM
+     outline.leading = true;
+     outline.bottom = true;
+     outline.trailing = true;
++  } else if (zen_mode_floating_style_) {
++    // Only the edge over the contents needs telling apart from them.
++    outline.color.color = kColorToolbarContentAreaSeparator;
++    const bool right_aligned =
++        browser_view() && browser_view()->IsVerticalTabStripRightAligned();
++    outline.leading = right_aligned;
++    outline.trailing = !right_aligned;
+   }
+ 
+   background->SetCorners(corners);
+   background->SetOutline(outline);
+-  background->SetPaintWithNativeFrameMaterials(floating);
++  background->SetPaintWithNativeFrameMaterials(zen_mode_floating_style_);
+ }
+ 
+ void VerticalTabStripRegionView::AddedToWidget() {
+@@ -370,6 +385,7 @@ void VerticalTabStripRegionView::AttachT
+     std::unique_ptr<ToolbarView> toolbar) {
+   CHECK(!hosted_toolbar_);
+   hosted_toolbar_ = AddChildViewAt(std::move(toolbar), 0);
++  UpdateFloatingStyle();
+   InvalidateLayout();
+ }
+ 
+@@ -379,6 +395,7 @@ std::unique_ptr<ToolbarView> VerticalTab
+   hosted_toolbar_ = nullptr;
+   bottom_button_container_->download_button()->SetVisible(false);
+   std::unique_ptr<ToolbarView> owned_toolbar = RemoveChildViewT(toolbar);
++  UpdateFloatingStyle();
+   InvalidateLayout();
+   return owned_toolbar;
+ }
+@@ -806,12 +823,12 @@ void VerticalTabStripRegionView::UpdateI
+     const bool top_chrome_visible_or_pinned =
+         top_chrome_ratio > 0.0f || browser->IsZenModeTopChromePinned();
+     const float ratio =
+-        zen_mode_floating_style_ || !top_chrome_visible_or_pinned
++        IsFloatingCard() || !top_chrome_visible_or_pinned
+             ? 1.0f
+             : 1.0f - top_chrome_ratio;
+     top_padding = base::ClampRound(
+         GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius) * ratio);
+-  } else if (zen_mode_floating_style_) {
++  } else if (IsFloatingCard()) {
+     top_padding = GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius);
+   }
+ 
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -110,6 +110,11 @@ class VerticalTabStripRegionView final
+ 
+   void UpdateInteriorMargin();
+ 
++  // Whether the tab strip floats as a card of its own, away from the window's
++  // edges. One that hosts the toolbar keeps its docked shape instead.
++  bool IsFloatingCard() const;
++  void UpdateFloatingStyle();
++
+   // views::View:
+   void AddedToWidget() override;
+   void RemovedFromWidget() override;

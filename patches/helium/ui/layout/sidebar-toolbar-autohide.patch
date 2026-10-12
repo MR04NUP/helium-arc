@@ -1,0 +1,491 @@
+--- a/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
++++ b/chrome/browser/ui/tabs/vertical_tab_strip_state_controller.cc
+@@ -213,6 +213,18 @@ VerticalTabStripStateController::GetColl
+ }
+ 
+ void VerticalTabStripStateController::RequestCollapse(bool collapse) {
++  // A tab strip that hosts the toolbar has no collapsed rail. It hides
++  // completely instead, and every collapse request toggles that.
++  const bool is_expand_request = IsCollapsed() && !collapse;
++  if (is_vertical_tabs_enabled_ && !is_expand_request &&
++      pref_service_->GetBoolean(prefs::kHeliumVerticalSidebarToolbar)) {
++    const bool is_hidden =
++        pref_service_->GetBoolean(prefs::kHeliumSidebarToolbarHidden);
++    pref_service_->SetBoolean(prefs::kHeliumSidebarToolbarHidden,
++                              collapse && !is_hidden);
++    return;
++  }
++
+   if (!delegate_) {
+     return;
+   }
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1597,6 +1597,12 @@ bool BrowserView::IsSidebarToolbarMode()
+          ShouldDrawVerticalTabStrip();
+ }
+ 
++bool BrowserView::IsSidebarToolbarHidden() const {
++  auto* controller = HeliumLayoutStateController::From(browser_);
++  return controller && controller->IsSidebarToolbarHidden() &&
++         IsSidebarToolbarMode();
++}
++
+ bool BrowserView::IsVerticalTabStripCollapsed() const {
+   if (auto* const controller =
+           tabs::VerticalTabStripStateController::From(browser_)) {
+@@ -1714,7 +1720,7 @@ float BrowserView::GetTopChromeRevealRat
+ }
+ 
+ float BrowserView::GetSideChromeRevealRatio() const {
+-  if (!zen_mode_enabled_) {
++  if (!IsChromeAutoHideActive()) {
+     return 1.f;
+   }
+   if (!ShouldDrawVerticalTabStrip()) {
+@@ -1789,7 +1795,7 @@ void BrowserView::OnVerticalTabStripMode
+   if (vertical_initialized == should_be_vertical) {
+     // Mode is unchanged; just re-layout so alignment-dependent views update.
+     UpdateSidebarToolbarAttachment();
+-    UpdateZenCollapseButtonVisibility();
++    UpdateZenModeState();
+     vertical_tab_strip_region_view_->InvalidateLayout();
+     InvalidateLayout();
+     return;
+@@ -1805,6 +1811,8 @@ void BrowserView::OnVerticalTabStripMode
+   }
+ 
+   UpdateSidebarToolbarAttachment();
++  // Whether the tab strip is hidden depends on whether it hosts the toolbar.
++  UpdateZenModeState();
+   GetFrameView()->OnTabStripStateChanged();
+ 
+   UpdateTabSearchBubbleHost();
+@@ -1858,6 +1866,12 @@ void BrowserView::UpdateSidebarToolbarAt
+     toolbar_top_container_index_ = top_container_->GetIndexOf(toolbar_);
+     vertical_tab_strip_region_view_->AttachToolbar(
+         top_container_->RemoveChildViewT(toolbar_.get()));
++
++    // The toolbar doesn't fit in the collapsed rail.
++    auto* controller = tabs::VerticalTabStripStateController::From(browser_);
++    if (controller && controller->IsCollapsed()) {
++      controller->RequestCollapse(false);
++    }
+   } else {
+     top_container_->AddChildViewAt(
+         vertical_tab_strip_region_view_->DetachToolbar(),
+@@ -1932,8 +1946,77 @@ void BrowserView::MaybeExpandVerticalTab
+   }
+ }
+ 
++bool BrowserView::IsChromeAutoHideActive() const {
++  return zen_mode_enabled_ || sidebar_toolbar_hidden_;
++}
++
++void BrowserView::UpdateSidebarToolbarHiddenState() {
++  const bool hidden = IsSidebarToolbarHidden();
++  if (sidebar_toolbar_hidden_ == hidden) {
++    return;
++  }
++  sidebar_toolbar_hidden_ = hidden;
++
++  if (hidden) {
++    // Focus inside the tab strip would keep it revealed.
++    views::View* const focused_view =
++        GetFocusManager() ? GetFocusManager()->GetFocusedView() : nullptr;
++    if (focused_view && vertical_tab_strip_region_view_ &&
++        vertical_tab_strip_region_view_->Contains(focused_view)) {
++      GetActiveContentsWebView()->RequestFocus();
++    }
++
++    // Hide right away, even when the cursor is still over the button that was
++    // just pressed. The tab strip then stays away until the cursor has left.
++    gfx::Point cursor = display::Screen::Get()->GetCursorScreenPoint();
++    views::View::ConvertPointFromScreen(this, &cursor);
++    side_reveal_suppressed_ =
++        IsPointInZenSideTrigger(cursor) || IsPointInZenSideChromeBounds(cursor);
++    zen_cursor_exit_timer_.Stop();
++    zen_side_chrome_animation_.Hide();
++  } else {
++    side_reveal_suppressed_ = false;
++    if (!zen_mode_enabled_ || IsZenModeSideChromePinned()) {
++      zen_side_chrome_animation_.Reset(1);
++    }
++  }
++
++  UpdateCaptionButtonsForSideChrome();
++  if (multi_contents_view_) {
++    multi_contents_view_->MaybeUpdateContentsBorderAndOverlay();
++  }
++  InvalidateLayout();
++}
++
++void BrowserView::RevealSideChromeImmediately() {
++  side_reveal_suppressed_ = false;
++  zen_cursor_exit_timer_.Stop();
++  zen_side_chrome_animation_.Reset(1);
++  UpdateCaptionButtonsForSideChrome();
++  InvalidateLayout();
++  DeprecatedLayoutImmediately();
++}
++
++void BrowserView::UpdateCaptionButtonsForSideChrome() {
++#if BUILDFLAG(IS_MAC)
++  // The caption buttons sit over a leading tab strip that hosts the toolbar,
++  // so they come and go with it. Zen mode fades them with the top chrome
++  // instead.
++  if (zen_mode_enabled_) {
++    return;
++  }
++  if (auto* frame_view = GetFrameView()) {
++    frame_view->SetCaptionButtonsOpacity(
++        sidebar_toolbar_hidden_ && !IsVerticalTabStripRightAligned()
++            ? GetSideChromeRevealRatio()
++            : 1.0f);
++  }
++#endif  // BUILDFLAG(IS_MAC)
++}
++
+ void BrowserView::UpdateZenModeState() {
+   const bool zen_mode_enabled = IsZenModeEnabled();
++  UpdateSidebarToolbarHiddenState();
+   UpdateZenModeEventMonitor();
+ 
+   if (zen_mode_enabled_ == zen_mode_enabled) {
+@@ -1983,7 +2066,7 @@ void BrowserView::UpdateZenModeState() {
+ }
+ 
+ void BrowserView::UpdateZenModeEventMonitor() {
+-  if (!GetWidget() || !IsZenModeEnabled()) {
++  if (!GetWidget() || !(IsZenModeEnabled() || IsSidebarToolbarHidden())) {
+     zen_mode_event_monitor_.reset();
+     return;
+   }
+@@ -2025,7 +2108,7 @@ bool BrowserView::IsLeavingZenSideGap(co
+ }
+ 
+ void BrowserView::UpdateZenModeRevealFromCursor() {
+-  if (!zen_mode_enabled_) {
++  if (!IsChromeAutoHideActive()) {
+     return;
+   }
+ 
+@@ -2047,17 +2130,27 @@ void BrowserView::UpdateZenModeRevealFro
+ 
+   const bool in_top_trigger = IsPointInZenTopTrigger(cursor);
+   const bool in_top_chrome = IsPointInZenTopChromeBounds(cursor);
+-  const bool reveal_top = in_top_trigger || in_top_chrome;
++  const bool in_side_trigger = IsPointInZenSideTrigger(cursor);
++  const bool in_side_chrome = IsPointInZenSideChromeBounds(cursor);
++
++  // A tab strip that hosts the toolbar reaches the top of the window, where
++  // it would otherwise count as top chrome.
++  const bool reveal_top = zen_mode_enabled_ &&
++                          (in_top_trigger || in_top_chrome) &&
++                          !(IsSidebarToolbarMode() && in_side_chrome);
++
++  // A tab strip that was just hidden stays hidden until the cursor leaves it.
++  if (side_reveal_suppressed_ && !in_side_trigger && !in_side_chrome) {
++    side_reveal_suppressed_ = false;
++  }
+ 
+   // Top bar takes precedence: don't reveal side chrome when the cursor
+   // is in the top trigger zone or over the revealed top chrome.
+-  const bool in_side_trigger = IsPointInZenSideTrigger(cursor);
+-  const bool in_side_chrome = IsPointInZenSideChromeBounds(cursor);
+   const bool moving_out_through_side_gap =
+       previous_cursor && IsLeavingZenSideGap(*previous_cursor, cursor);
+   const bool reveal_side =
+       !reveal_top && !moving_out_through_side_gap &&
+-      (in_side_trigger || in_side_chrome);
++      !side_reveal_suppressed_ && (in_side_trigger || in_side_chrome);
+ 
+   // Defer the collapse briefly so quick excursions don't cause the
+   // chrome to snap closed.
+@@ -2071,7 +2164,7 @@ void BrowserView::UpdateZenModeRevealFro
+ }
+ 
+ void BrowserView::UpdateZenModeReveal(bool reveal_top, bool reveal_side) {
+-  if (!zen_mode_enabled_) {
++  if (!IsChromeAutoHideActive()) {
+     return;
+   }
+ 
+@@ -2079,21 +2172,27 @@ void BrowserView::UpdateZenModeReveal(bo
+     reveal_side = false;
+   }
+ 
+-  // Pinned VTS stays visible regardless of cursor position.
+-  if (IsZenModeSideChromePinned()) {
++  // Pinned VTS stays visible regardless of cursor position, unless it hosts
++  // the toolbar and was hidden.
++  if (IsZenModeSideChromePinned() && !sidebar_toolbar_hidden_) {
+     reveal_side = true;
+   }
+ 
+-  // Pinned top chrome stays visible regardless of cursor position.
+-  if (IsZenModeTopChromePinned()) {
++  // Pinned top chrome stays visible regardless of cursor position. Outside
++  // zen mode, only the side chrome hides.
++  if (!zen_mode_enabled_ || IsZenModeTopChromePinned()) {
+     reveal_top = true;
+   }
+ 
+-  // Keep the top chrome visible while the omnibox is focused.
++  // The toolbar's controls keep whichever chrome hosts them visible.
++  const bool toolbar_in_side_chrome = IsSidebarToolbarMode();
++  bool& reveal_toolbar = toolbar_in_side_chrome ? reveal_side : reveal_top;
++
++  // Keep the toolbar visible while the omnibox is focused.
+   const bool omnibox_focused = toolbar_ && toolbar_->location_bar_view() &&
+                                toolbar_->location_bar_view()->HasFocus();
+   if (omnibox_focused) {
+-    reveal_top = true;
++    reveal_toolbar = true;
+   }
+ 
+   // Keep the top chrome visible while a bubble/popup anchored inside the top
+@@ -2102,15 +2201,20 @@ void BrowserView::UpdateZenModeReveal(bo
+     reveal_top = true;
+   }
+ 
++  if (!reveal_side && toolbar_in_side_chrome &&
++      HasOpenBubbleFromVerticalTabStrip()) {
++    reveal_side = true;
++  }
++
+   // Menus are not BubbleDialogDelegate widgets, so handle the app menu
+   // explicitly.
+-  if (!reveal_top) {
++  if (!reveal_toolbar) {
+     auto* toolbar_button_provider = ToolbarButtonProvider::From(browser_);
+     const AppMenuControl* app_menu_control =
+         toolbar_button_provider ? toolbar_button_provider->GetAppMenuControl()
+                                 : nullptr;
+     if (app_menu_control && app_menu_control->IsMenuShowing()) {
+-      reveal_top = true;
++      reveal_toolbar = true;
+     }
+   }
+ 
+@@ -2231,6 +2335,20 @@ bool IsSidePanelOpen(const SidePanel* si
+ 
+ }  // namespace
+ 
++bool BrowserView::HasOpenBubbleFromVerticalTabStrip() const {
++  if (!vertical_tab_strip_region_view_ || !GetWidget()) {
++    return false;
++  }
++  for (views::Widget* widget :
++       views::Widget::GetAllOwnedWidgets(GetWidget()->GetNativeView())) {
++    if (IsOpenBubbleAnchoredInViewSubtree(widget,
++                                          vertical_tab_strip_region_view_)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool BrowserView::HasOpenBubbleFromTopContainer() const {
+   if (IsSidePanelOpen(side_panel_)) {
+     return true;
+@@ -2248,13 +2366,15 @@ bool BrowserView::HasOpenBubbleFromTopCo
+ }
+ 
+ void BrowserView::AppMenuShown() {
+-  if (zen_mode_enabled_) {
+-    UpdateZenModeReveal(/*reveal_top=*/true, /*reveal_side=*/false);
++  if (IsChromeAutoHideActive()) {
++    const bool toolbar_in_side_chrome = IsSidebarToolbarMode();
++    UpdateZenModeReveal(/*reveal_top=*/!toolbar_in_side_chrome,
++                        /*reveal_side=*/toolbar_in_side_chrome);
+   }
+ }
+ 
+ void BrowserView::AppMenuClosed() {
+-  if (zen_mode_enabled_) {
++  if (IsChromeAutoHideActive()) {
+     UpdateZenModeRevealFromCursor();
+   }
+ }
+@@ -3055,7 +3175,9 @@ void BrowserView::SetFocusToLocationBar(
+   // In zen mode, snap the toolbar to fully shown so the omnibox is visible
+   // and can receive focus.  A synchronous layout is required so the toolbar
+   // has non-zero height before FocusLocation runs.
+-  if (zen_mode_enabled_) {
++  if (IsChromeAutoHideActive() && IsSidebarToolbarMode()) {
++    RevealSideChromeImmediately();
++  } else if (zen_mode_enabled_) {
+     RevealZenModeTopChromeImmediately();
+   }
+ 
+@@ -6857,13 +6979,13 @@ void BrowserView::OnWillChangeFocus(View
+ }
+ void BrowserView::OnDidChangeFocus(View* focused_before, View* focused_now) {
+   UpdateAccessibleNameForRootView();
+-  if (zen_mode_enabled_) {
++  if (IsChromeAutoHideActive()) {
+     UpdateZenModeRevealFromCursor();
+   }
+ }
+ 
+ void BrowserView::OnEvent(const ui::Event& event) {
+-  if (!zen_mode_enabled_ || !event.IsMouseEvent()) {
++  if (!IsChromeAutoHideActive() || !event.IsMouseEvent()) {
+     return;
+   }
+   // Mouse exit events can also come from internal view transitions. Only use
+@@ -6894,6 +7016,9 @@ void BrowserView::AnimationProgressed(co
+       multi_contents_view_->MaybeUpdateBorderForZenReveal();
+     }
+     InvalidateLayout();
++    if (!top_chrome_animation) {
++      UpdateCaptionButtonsForSideChrome();
++    }
+     if (top_chrome_animation) {
+       if (auto* frame_view = GetFrameView()) {
+         // Fade caption buttons with the toolbar.  The toolbar still reserves
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -369,6 +369,10 @@ class BrowserView : public BrowserWindow
+   // Returns whether the toolbar is shown at the top of the vertical tab strip.
+   bool IsSidebarToolbarMode() const;
+ 
++  // Returns whether the vertical tab strip that hosts the toolbar is hidden
++  // until the window edge is hovered.
++  bool IsSidebarToolbarHidden() const;
++
+   // Returns whether or not strokes should be drawn around and under the tabs.
+   bool ShouldDrawTabStrokes() const;
+ 
+@@ -961,6 +965,14 @@ class BrowserView : public BrowserWindow
+   void UpdateZenModeRevealFromCursor();
+   void UpdateZenModeReveal(bool reveal_top, bool reveal_side);
+   void RevealZenModeTopChromeImmediately();
++
++  // Hiding the vertical tab strip that hosts the toolbar reuses zen mode's
++  // side chrome reveal.
++  bool IsChromeAutoHideActive() const;
++  void UpdateSidebarToolbarHiddenState();
++  void RevealSideChromeImmediately();
++  void UpdateCaptionButtonsForSideChrome();
++  bool HasOpenBubbleFromVerticalTabStrip() const;
+   bool IsZenModeEnabled() const;
+   bool IsPointInZenTopTrigger(const gfx::Point& point) const;
+   bool IsPointInZenSideTrigger(const gfx::Point& point) const;
+@@ -1257,6 +1269,12 @@ class BrowserView : public BrowserWindow
+   // The toolbar's index in the top container while it is hosted in the
+   // vertical tab strip.
+   std::optional<size_t> toolbar_top_container_index_;
++
++  // Whether the vertical tab strip that hosts the toolbar is hidden.
++  bool sidebar_toolbar_hidden_ = false;
++  // Keeps a just-hidden tab strip from reappearing under a cursor that hasn't
++  // moved away yet.
++  bool side_reveal_suppressed_ = false;
+   // The Toolbar containing the navigation buttons, menus and the address bar.
+   raw_ptr<ToolbarView> toolbar_ = nullptr;
+ 
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate.h
+@@ -62,6 +62,7 @@ class BrowserViewLayoutDelegate {
+   virtual float GetSideChromeRevealRatio() const { return 1.f; }
+   virtual bool IsZenModeSideChromePinned() const { return false; }
+   virtual bool IsZenModeTopChromePinned() const { return false; }
++  virtual bool IsSidebarToolbarHiddenForLayout() const { return false; }
+   virtual gfx::NativeView GetHostViewForAnchoring() const = 0;
+   virtual bool HasFindBarController() const = 0;
+   virtual void MoveWindowForFindBarIfNecessary() const = 0;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -231,6 +231,10 @@ bool BrowserViewLayoutDelegateImpl::IsZe
+   return browser_view_->IsZenModeEnabledForLayout();
+ }
+ 
++bool BrowserViewLayoutDelegateImpl::IsSidebarToolbarHiddenForLayout() const {
++  return browser_view_->IsSidebarToolbarHidden();
++}
++
+ float BrowserViewLayoutDelegateImpl::GetTopChromeRevealRatio() const {
+   return browser_view_->GetTopChromeRevealRatio();
+ }
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.h
+@@ -47,6 +47,7 @@ class BrowserViewLayoutDelegateImpl : pu
+   float GetSideChromeRevealRatio() const override;
+   bool IsZenModeSideChromePinned() const override;
+   bool IsZenModeTopChromePinned() const override;
++  bool IsSidebarToolbarHiddenForLayout() const override;
+   gfx::NativeView GetHostViewForAnchoring() const override;
+   bool HasFindBarController() const override;
+   void MoveWindowForFindBarIfNecessary() const override;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_tabbed_layout_impl.cc
+@@ -131,9 +131,14 @@ ZenModeLayoutState GetZenModeLayoutState
+     bool vertical_tab_strip_active) {
+   ZenModeLayoutState state;
+   state.enabled = delegate.IsZenModeEnabledForLayout();
+-  state.floating_vertical_tab_strip = state.enabled &&
+-                                      vertical_tab_strip_active &&
+-                                      !delegate.IsZenModeSideChromePinned();
++  // A hidden tab strip that hosts the toolbar floats in the same way as an
++  // unpinned one in zen mode.
++  const bool sidebar_toolbar_hidden =
++      delegate.IsSidebarToolbarHiddenForLayout();
++  state.floating_vertical_tab_strip =
++      vertical_tab_strip_active &&
++      (sidebar_toolbar_hidden ||
++       (state.enabled && !delegate.IsZenModeSideChromePinned()));
+   state.top_chrome_ratio = delegate.GetTopChromeRevealRatio();
+   state.side_chrome_ratio = delegate.GetSideChromeRevealRatio();
+ 
+@@ -145,7 +150,10 @@ ZenModeLayoutState GetZenModeLayoutState
+   const int revealed_top_padding =
+       std::max(0, GetGenericFrameRadius() -
+                       GetLayoutConstant(LayoutConstant::kHeliumBasePadding));
+-  if (delegate.IsZenModeTopChromePinned()) {
++  if (sidebar_toolbar_hidden && !state.enabled) {
++    // There is no top chrome to sit under.
++    state.vertical_tab_strip_top_padding = state.vertical_tab_strip_padding;
++  } else if (delegate.IsZenModeTopChromePinned()) {
+     state.vertical_tab_strip_top_padding = revealed_top_padding;
+   } else {
+     state.vertical_tab_strip_top_padding =
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -622,7 +622,9 @@ void VerticalTabStripRegionView::OnResiz
+   }
+ 
+   tabs::VerticalTabStripState new_state;
+-  new_state.collapsed = proposed_width <= kCollapseSnapWidth;
++  // A hosted toolbar needs the full width, so dragging can't collapse.
++  new_state.collapsed =
++      !hosted_toolbar_ && proposed_width <= kCollapseSnapWidth;
+   new_state.uncollapsed_width = target_collapse_state_.uncollapsed_width;
+   if (!new_state.collapsed) {
+     new_state.uncollapsed_width =
+@@ -802,6 +804,8 @@ void VerticalTabStripRegionView::UpdateI
+             : 1.0f - top_chrome_ratio;
+     top_padding = base::ClampRound(
+         GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius) * ratio);
++  } else if (zen_mode_floating_style_) {
++    top_padding = GetLayoutConstant(LayoutConstant::kVerticalTabCornerRadius);
+   }
+ 
+   flex_layout_->SetInteriorMargin(
+--- a/chrome/browser/ui/views/toolbar/toolbar_view.cc
++++ b/chrome/browser/ui/views/toolbar/toolbar_view.cc
+@@ -2636,8 +2636,11 @@ void ToolbarView::UpdateVerticalTabsColl
+   const gfx::VectorIcon& icon = controller->IsTabStripRightAligned()
+                                     ? views::kSidebarRightIcon
+                                     : views::kSidebarLeftIcon;
+-  const int text_id = controller->IsCollapsed() ? IDS_EXPAND_VERTICAL_TABS
+-                                                : IDS_COLLAPSE_VERTICAL_TABS;
++  const bool collapsed = sidebar_mode_
++                             ? browser_view_->IsSidebarToolbarHidden()
++                             : controller->IsCollapsed();
++  const int text_id =
++      collapsed ? IDS_EXPAND_VERTICAL_TABS : IDS_COLLAPSE_VERTICAL_TABS;
+   const std::u16string text = l10n_util::GetStringUTF16(text_id);
+ 
+   vertical_tabs_collapse_button_->SetVectorIcon(icon);

@@ -1,0 +1,320 @@
+--- a/chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.cc
++++ b/chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.cc
+@@ -98,7 +98,23 @@ PinnedToolbarActions* GetPinnedToolbarAc
+              : nullptr;
+ }
+ 
++// Returns the downloads button in the vertical tab strip, which is used while
++// the tab strip hosts the toolbar, unless downloads are pinned among the
++// toolbar's actions.
++ToolbarButton* GetSidebarDownloadsButton(BrowserView* browser_view) {
++  ToolbarButton* const button = browser_view->GetSidebarDownloadButton();
++  if (!button) {
++    return nullptr;
++  }
++  auto* container = GetPinnedToolbarActions(browser_view);
++  return container && container->IsActionPinned(kActionShowDownloads) ? nullptr
++                                                                       : button;
++}
++
+ ToolbarButton* GetDownloadsButton(BrowserView* browser_view) {
++  if (ToolbarButton* sidebar_button = GetSidebarDownloadsButton(browser_view)) {
++    return sidebar_button;
++  }
+   auto* container = GetPinnedToolbarActions(browser_view);
+   return container ? container->GetDownloadButton() : nullptr;
+ }
+@@ -475,6 +491,10 @@ void DownloadToolbarUIController::TearDo
+ }
+ 
+ void DownloadToolbarUIController::Show() {
++  if (ToolbarButton* sidebar_button = GetSidebarDownloadsButton(browser_view_)) {
++    sidebar_button->SetVisible(true);
++    return;
++  }
+   auto* container = GetPinnedToolbarActions(browser_view_);
+   if (!container) {
+     return;
+@@ -484,6 +504,10 @@ void DownloadToolbarUIController::Show()
+ 
+ void DownloadToolbarUIController::Hide() {
+   HideDetails();
++  if (ToolbarButton* sidebar_button = GetSidebarDownloadsButton(browser_view_)) {
++    sidebar_button->SetVisible(false);
++    return;
++  }
+   auto* container = GetPinnedToolbarActions(browser_view_);
+   if (!container) {
+     return;
+@@ -726,6 +750,12 @@ void DownloadToolbarUIController::Update
+     action_item_->SetTooltipText(tooltip_for_progress_count);
+   }
+ 
++  // The button in the vertical tab strip isn't driven by the action item.
++  if (button == GetSidebarDownloadsButton(browser_view_)) {
++    button->SetVectorIcon(*new_icon);
++    button->SetTooltipText(std::u16string(action_item_->GetTooltipText()));
++  }
++
+   redraw_progress_soon_ = false;
+ 
+   DownloadProgressRing* progress_ring = GetProgressRing(browser_view_);
+@@ -959,6 +989,14 @@ void DownloadToolbarUIController::ShowBu
+     return;
+   }
+ 
++  if (ToolbarButton* sidebar_button = GetSidebarDownloadsButton(browser_view_)) {
++    // A hidden tab strip has to come back for the bubble to have an anchor.
++    browser_view_->RevealSidebarToolbar();
++    pending_bubble_ = true;
++    OnBubbleAnchorAssembled(views::BubbleAnchor(sidebar_button));
++    return;
++  }
++
+   auto* container = GetPinnedToolbarActions(browser_view_);
+   if (!container) {
+     return;
+@@ -994,8 +1032,16 @@ void DownloadToolbarUIController::OnBubb
+           ImmersiveModeController::ANIMATE_REVEAL_YES);
+     }
+   }
++  // From the bottom of the vertical tab strip, the bubble opens upwards and
++  // over the page.
++  views::BubbleBorder::Arrow arrow = views::BubbleBorder::TOP_RIGHT;
++  if (browser_view_ && GetSidebarDownloadsButton(browser_view_)) {
++    arrow = browser_view_->IsVerticalTabStripRightAligned()
++                ? views::BubbleBorder::BOTTOM_RIGHT
++                : views::BubbleBorder::BOTTOM_LEFT;
++  }
+   auto bubble_delegate = std::make_unique<views::BubbleDialogDelegate>(
+-      anchor.value(), views::BubbleBorder::TOP_RIGHT,
++      anchor.value(), arrow,
+       views::BubbleBorder::DIALOG_SHADOW,
+       /*autosize=*/true);
+   bubble_delegate->SetOwnedByWidget(
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -157,6 +157,7 @@
+ #include "chrome/browser/ui/views/bookmarks/bookmark_page_action_controller.h"
+ #include "chrome/browser/ui/views/bubble_anchor_util_views.h"
+ #include "chrome/browser/ui/views/color_provider_browser_helper.h"
++#include "chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.h"
+ #include "chrome/browser/ui/views/download/download_in_progress_dialog_view.h"
+ #include "chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views.h"
+ #include "chrome/browser/ui/views/exclusive_access/exclusive_access_bubble_views_context.h"
+@@ -1892,6 +1893,13 @@ void BrowserView::UpdateSidebarToolbarAt
+     return;
+   }
+ 
++  // The downloads button lives with the toolbar, so it moves along.
++  auto* const download_ui = DownloadToolbarUIController::From(browser_);
++  const bool downloads_showing = download_ui && download_ui->IsShowing();
++  if (downloads_showing) {
++    download_ui->Hide();
++  }
++
+   if (should_host) {
+     if (toolbar_->parent() != top_container_) {
+       return;
+@@ -1913,6 +1921,10 @@ void BrowserView::UpdateSidebarToolbarAt
+   }
+ 
+   toolbar_->SetSidebarMode(should_host);
++  if (downloads_showing) {
++    download_ui->Show();
++    download_ui->UpdateIcon();
++  }
+   InvalidateLayout();
+ }
+ 
+@@ -1979,6 +1991,18 @@ void BrowserView::MaybeExpandVerticalTab
+   }
+ }
+ 
++void BrowserView::RevealSidebarToolbar() {
++  if (IsChromeAutoHideActive() && IsSidebarToolbarMode()) {
++    RevealSideChromeImmediately();
++  }
++}
++
++ToolbarButton* BrowserView::GetSidebarDownloadButton() {
++  return vertical_tab_strip_region_view_
++             ? vertical_tab_strip_region_view_->GetSidebarDownloadButton()
++             : nullptr;
++}
++
+ bool BrowserView::IsChromeAutoHideActive() const {
+   return zen_mode_enabled_ || sidebar_toolbar_hidden_;
+ }
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -100,6 +100,7 @@ class TabDragTarget;
+ class TabSearchBubbleHost;
+ class TabStrip;
+ class TabStripRegionView;
++class ToolbarButton;
+ class ToolbarButtonProvider;
+ class ToolbarView;
+ class TopContainerView;
+@@ -373,6 +374,14 @@ class BrowserView : public BrowserWindow
+   // until the window edge is hovered.
+   bool IsSidebarToolbarHidden() const;
+ 
++  // Brings back a hidden vertical tab strip that hosts the toolbar, so that
++  // something can be anchored to it.
++  void RevealSidebarToolbar();
++
++  // The downloads button in a vertical tab strip that hosts the toolbar, or
++  // null while the toolbar is elsewhere.
++  ToolbarButton* GetSidebarDownloadButton();
++
+   // Returns whether or not strokes should be drawn around and under the tabs.
+   bool ShouldDrawTabStrokes() const;
+ 
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -376,11 +376,17 @@ std::unique_ptr<ToolbarView> VerticalTab
+   CHECK(hosted_toolbar_);
+   ToolbarView* const toolbar = hosted_toolbar_;
+   hosted_toolbar_ = nullptr;
++  bottom_button_container_->download_button()->SetVisible(false);
+   std::unique_ptr<ToolbarView> owned_toolbar = RemoveChildViewT(toolbar);
+   InvalidateLayout();
+   return owned_toolbar;
+ }
+ 
++ToolbarButton* VerticalTabStripRegionView::GetSidebarDownloadButton() {
++  return hosted_toolbar_ ? bottom_button_container_->download_button()
++                         : nullptr;
++}
++
+ void VerticalTabStripRegionView::SetHostedToolbarCaptionInsetsForLayout(
+     int leading,
+     int trailing) {
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -33,6 +33,7 @@
+ #include "ui/views/focus/focus_manager.h"
+ 
+ class BrowserView;
++class ToolbarButton;
+ class ToolbarView;
+ class VerticalTabStripBottomContainer;
+ class VerticalTabStripFocusSwipeController;
+@@ -98,6 +99,10 @@ class VerticalTabStripRegionView final
+   // trailing edges of the hosted toolbar.
+   void SetHostedToolbarCaptionInsetsForLayout(int leading, int trailing);
+ 
++  // The downloads button for a tab strip that hosts the toolbar, or null while
++  // the toolbar is elsewhere.
++  ToolbarButton* GetSidebarDownloadButton();
++
+   void UpdateInteriorMargin();
+ 
+   // views::View:
+--- a/chrome/browser/ui/views/tabs/vertical/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/vertical/BUILD.gn
+@@ -67,6 +67,7 @@ source_set("impl") {
+     "//chrome/browser/ui/tabs/saved_tab_groups",
+     "//chrome/browser/ui/user_education",
+     "//chrome/browser/ui/views:layout_provider",
++    "//chrome/browser/ui/views/download",
+     "//chrome/browser/ui/views/frame",
+     "//chrome/browser/ui/views/tabs/common",
+     "//chrome/browser/ui/views/tabs/common:impl",
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.cc
+@@ -7,10 +7,15 @@
+ #include "base/functional/bind.h"
+ #include "chrome/browser/ui/browser_element_identifiers.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/download/bubble/download_toolbar_ui_controller.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ #include "chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h"
+ #include "chrome/browser/ui/views/tabs/vertical/vertical_new_tab_button.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_button.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
+ #include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/view_class_properties.h"
+ 
+ VerticalTabStripBottomContainer::VerticalTabStripBottomContainer(
+@@ -36,6 +41,19 @@ VerticalTabStripBottomContainer::Vertica
+ 
+   new_tab_button_ = AddChildView(std::move(new_tab_button));
+ 
++  // The downloads button sits in the bottom corner, outside the flow of the
++  // other buttons. The download UI shows it and keeps its icon up to date.
++  auto download_button = std::make_unique<ToolbarButton>(base::BindRepeating(
++      &VerticalTabStripBottomContainer::OnDownloadButtonPressed,
++      base::Unretained(this)));
++  const std::u16string download_label =
++      l10n_util::GetStringUTF16(IDS_TOOLTIP_DOWNLOAD_ICON);
++  download_button->SetTooltipText(download_label);
++  download_button->GetViewAccessibility().SetName(download_label);
++  download_button->SetProperty(views::kViewIgnoredByLayoutKey, true);
++  download_button->SetVisible(false);
++  download_button_ = AddChildView(std::move(download_button));
++
+   OnCollapseStateChanged(state_controller->GetCollapseState());
+   collapsed_state_change_subscription_ =
+       state_controller->RegisterOnCollapseChanged(base::BindRepeating(
+@@ -46,6 +64,21 @@ VerticalTabStripBottomContainer::Vertica
+ VerticalTabStripBottomContainer::~VerticalTabStripBottomContainer() = default;
+ 
+ 
++void VerticalTabStripBottomContainer::Layout(PassKey) {
++  LayoutSuperclass<views::FlexLayoutView>(this);
++
++  const gfx::Size size = download_button_->GetPreferredSize();
++  download_button_->SetBoundsRect(gfx::Rect(width() - size.width(),
++                                            height() - size.height(),
++                                            size.width(), size.height()));
++}
++
++void VerticalTabStripBottomContainer::OnDownloadButtonPressed() {
++  if (auto* download_ui = DownloadToolbarUIController::From(browser_)) {
++    download_ui->InvokeUI();
++  }
++}
++
+ bool VerticalTabStripBottomContainer::IsPositionInWindowCaption(
+     const gfx::Point& point) {
+   for (views::View* child : children()) {
+--- a/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
++++ b/chrome/browser/ui/views/tabs/vertical/vertical_tab_strip_bottom_container.h
+@@ -12,6 +12,7 @@
+ 
+ class BrowserWindowInterface;
+ class ExpandOnHoverLock;
++class ToolbarButton;
+ class VerticalNewTabButton;
+ 
+ namespace actions {
+@@ -36,6 +37,13 @@ class VerticalTabStripBottomContainer :
+ 
+   bool IsPositionInWindowCaption(const gfx::Point& point);
+ 
++  // The downloads button shown in the bottom corner while the tab strip hosts
++  // the toolbar. It stays hidden until there are downloads to show.
++  ToolbarButton* download_button() { return download_button_; }
++
++  // views::FlexLayoutView:
++  void Layout(PassKey) override;
++
+   void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
+ 
+  private:
+@@ -44,8 +52,11 @@ class VerticalTabStripBottomContainer :
+ 
+   void UpdateButtonStyles(bool collapsed);
+ 
++  void OnDownloadButtonPressed();
++
+   raw_ptr<BrowserWindowInterface> browser_ = nullptr;
+   raw_ptr<VerticalNewTabButton> new_tab_button_ = nullptr;
++  raw_ptr<ToolbarButton> download_button_ = nullptr;
+   base::CallbackListSubscription collapsed_state_change_subscription_;
+   base::CallbackListSubscription new_tab_button_pressed_subscription_;
+ 

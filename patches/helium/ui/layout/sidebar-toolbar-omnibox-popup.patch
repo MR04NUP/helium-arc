@@ -1,0 +1,110 @@
+--- a/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
+@@ -32,6 +32,7 @@
+ #include "chrome/browser/ui/views/omnibox/omnibox_view_views.h"
+ #include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
+ #include "chrome/browser/ui/views/theme_copying_widget.h"
++#include "chrome/browser/ui/views/toolbar/toolbar_view.h"
+ #include "components/omnibox/common/omnibox_feature_configs.h"
+ #include "components/omnibox/common/omnibox_metrics_utils.h"
+ #include "components/viz/common/frame_timing_details.h"
+@@ -45,10 +46,16 @@
+ #include "ui/views/cascading_property.h"
+ #include "ui/views/layout/box_layout.h"
+ #include "ui/views/property_effects.h"
++#include "ui/views/view_utils.h"
+ #include "ui/views/widget/widget.h"
+ 
+ namespace {
+ 
++// The narrowest popup shown for an address bar hosted in the vertical tab
++// strip, and the gap it keeps from the far edge of the window.
++constexpr int kSidebarPopupMinWidth = 600;
++constexpr int kSidebarPopupWindowMargin = 8;
++
+ #if BUILDFLAG(IS_WIN)
+ // Removes forced software compositing for `AutocompletePopupWidget` below.
+ // TODO(thestig): Remove this kill switch after a safe rollout, in M145.
+@@ -751,6 +758,28 @@ gfx::Rect OmniboxPopupViewViews::GetTarg
+       -RoundedOmniboxResultsFrame::GetLocationBarAlignmentInsets());
+   content_rect.set_height(popup_height);
+ 
++  // An address bar hosted in the vertical tab strip is too narrow to read
++  // results in, so let the popup grow over the page beside it.
++  if (const auto* toolbar =
++          views::AsViewClass<ToolbarView>(location_bar_view_->parent());
++      toolbar && toolbar->is_sidebar_mode() &&
++      content_rect.width() < kSidebarPopupMinWidth) {
++    const gfx::Rect window_bounds =
++        location_bar_view_->GetWidget()->GetWindowBoundsInScreen();
++    const bool grow_leading =
++        content_rect.CenterPoint().x() > window_bounds.CenterPoint().x();
++    const int available_width =
++        (grow_leading ? content_rect.right() - window_bounds.x()
++                      : window_bounds.right() - content_rect.x()) -
++        kSidebarPopupWindowMargin;
++    const int width = std::max(
++        content_rect.width(), std::min(kSidebarPopupMinWidth, available_width));
++    if (grow_leading) {
++      content_rect.set_x(content_rect.right() - width);
++    }
++    content_rect.set_width(width);
++  }
++
+   if (omnibox::IsWebUIOmniboxPopupEnabled() &&
+       !omnibox::IsWebUIOmniboxFullPopupEnabled() &&
+       !omnibox::IsAimPopupFeatureEnabled() &&
+--- a/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
++++ b/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h"
+ 
++#include <algorithm>
+ #include <memory>
+ #include <utility>
+ 
+@@ -234,7 +235,9 @@ RoundedOmniboxResultsFrame::RoundedOmnib
+     views::View* contents,
+     LocationBar* location_bar,
+     bool forward_mouse_events)
+-    : contents_(contents), forward_mouse_events_(forward_mouse_events) {
++    : contents_(contents),
++      location_bar_(location_bar),
++      forward_mouse_events_(forward_mouse_events) {
+   const int corner_radius = 12;
+   auto* webui_content = GetOmniboxPopupWebUIBaseContent();
+   const bool masks_to_bounds =
+@@ -367,6 +370,20 @@ void RoundedOmniboxResultsFrame::Layout(
+     gfx::Rect top_bounds(contents_host_->GetContentsBounds());
+     top_bounds.set_height(GetNonResultSectionHeight(true));
+     top_bounds.Inset(GetLocationBarAlignmentInsets());
++
++    // The cutout only belongs over the location bar. A frame that is wider
++    // than the location bar would otherwise show the page beside it.
++    if (location_bar_ && GetWidget()) {
++      const gfx::Rect location_bar_bounds = views::View::ConvertRectFromScreen(
++          contents_host_, location_bar_->BoundsInScreen());
++      const int left = std::max(top_bounds.x(), location_bar_bounds.x());
++      const int right =
++          std::min(top_bounds.right(), location_bar_bounds.right());
++      if (right > left) {
++        top_bounds.set_x(left);
++        top_bounds.set_width(right - left);
++      }
++    }
+     top_background_->SetBoundsRect(top_bounds);
+   }
+ 
+--- a/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
++++ b/chrome/browser/ui/views/omnibox/rounded_omnibox_results_frame.h
+@@ -81,6 +81,9 @@ class RoundedOmniboxResultsFrame : publi
+   raw_ptr<views::View> contents_host_ = nullptr;
+   raw_ptr<views::View> contents_;
+ 
++  // The location bar that shows through the cutout at the top of the frame.
++  raw_ptr<const LocationBar> location_bar_ = nullptr;
++
+   // Only used on platforms that support Aura (non-Mac).
+   [[maybe_unused]] bool forward_mouse_events_;
+ };

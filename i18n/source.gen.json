@@ -1237,6 +1237,18 @@
     "message": "New tab opened"
   },
   {
+    "name": "IDS_SETTINGS_VERTICAL_SIDEBAR_TOOLBAR",
+    "source": "chrome/app/settings_strings.grdp",
+    "context": "Label for the toggle that moves the address bar and toolbar buttons from the top of the window into the top of the vertical tabs sidebar.",
+    "message": "Show the toolbar in the sidebar"
+  },
+  {
+    "name": "IDS_SIDEBAR_PAGE_MENU_MORE",
+    "source": "chrome/app/generated_resources.grd",
+    "context": "The last item of the short menu opened from the three-dots button beside the address bar when the toolbar is shown in the vertical tabs sidebar. Opens the full browser menu.",
+    "message": "More"
+  },
+  {
     "name": "IDS_SETTINGS_NATIVE_FRAME_MATERIALS",
     "source": "chrome/app/settings_strings.grdp",
     "context": "Label for the toggle which enables or disables native system materials on the browser frame.",
