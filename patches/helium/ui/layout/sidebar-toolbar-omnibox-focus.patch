@@ -1,0 +1,254 @@
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.cc
+@@ -299,6 +299,15 @@ bool ChromeOmniboxClient::CurrentPageExi
+   return (location_bar_->GetWebContents() != nullptr);
+ }
+ 
++bool ChromeOmniboxClient::ShowsSuggestionsOnFocusForPages() const {
++  // An address bar hosted in the vertical tab strip is too narrow to read an
++  // address in, so it opens its results as soon as it is focused.
++  const auto* const layout_state_controller =
++      browser_ ? HeliumLayoutStateController::From(browser_) : nullptr;
++  return layout_state_controller &&
++         layout_state_controller->IsSidebarToolbarEnabled();
++}
++
+ const GURL& ChromeOmniboxClient::GetURL() const {
+   return CurrentPageExists() ? location_bar_->GetWebContents()->GetVisibleURL()
+                              : GURL::EmptyGURL();
+--- a/chrome/browser/ui/omnibox/chrome_omnibox_client.h
++++ b/chrome/browser/ui/omnibox/chrome_omnibox_client.h
+@@ -50,6 +50,7 @@ class ChromeOmniboxClient final : public
+   std::unique_ptr<AutocompleteProviderClient> CreateAutocompleteProviderClient()
+       override;
+   bool CurrentPageExists() const override;
++  bool ShowsSuggestionsOnFocusForPages() const override;
+   const GURL& GetURL() const override;
+   const std::u16string& GetTitle() const override;
+   gfx::Image GetFavicon() const override;
+--- a/chrome/browser/ui/omnibox/omnibox_edit_model.cc
++++ b/chrome/browser/ui/omnibox/omnibox_edit_model.cc
+@@ -1298,6 +1298,12 @@ void OmniboxEditModel::StartZeroSuggestR
+     return;
+   }
+ 
++  // Early exit if nothing is to be suggested for a page that is already open.
++  if (!omnibox::IsNTPPage(GetPageClassification()) &&
++      !controller_->client()->ShowsSuggestionsOnFocusForPages()) {
++    return;
++  }
++
+   TRACE_EVENT0("omnibox", "OmniboxEditModel::StartZeroSuggestRequest");
+ 
+   // Send the textfield contents exactly as-is, as otherwise the verbatim
+--- a/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
++++ b/chrome/browser/ui/views/omnibox/omnibox_popup_view_views.cc
+@@ -16,6 +16,7 @@
+ #include "base/functional/bind.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/time/time.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/page_load_metrics/observers/top_chrome_webui_metrics_observer.h"
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+@@ -41,6 +42,7 @@
+ #include "ui/compositor/closure_animation_observer.h"
+ #include "ui/compositor/layer.h"
+ #include "ui/compositor/scoped_layer_animation_settings.h"
++#include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/image/image.h"
+ #include "ui/views/accessibility/view_accessibility.h"
+ #include "ui/views/cascading_property.h"
+@@ -56,6 +58,17 @@ namespace {
+ constexpr int kSidebarPopupMinWidth = 600;
+ constexpr int kSidebarPopupWindowMargin = 8;
+ 
++// How long that popup takes to unveil itself from the address bar, and a
++// height that is out of reach of its results while it does.
++constexpr base::TimeDelta kSidebarPopupUnveilDuration = base::Milliseconds(180);
++constexpr int kSidebarPopupUnveilClipHeight = 1 << 14;
++
++bool IsHostedInVerticalTabStrip(const LocationBarView* location_bar_view) {
++  const auto* toolbar =
++      views::AsViewClass<ToolbarView>(location_bar_view->parent());
++  return toolbar && toolbar->is_sidebar_mode();
++}
++
+ #if BUILDFLAG(IS_WIN)
+ // Removes forced software compositing for `AutocompletePopupWidget` below.
+ // TODO(thestig): Remove this kill switch after a safe rollout, in M145.
+@@ -145,6 +158,11 @@ class OmniboxPopupViewViews::PopupWidget
+   }
+ 
+   void SetTargetBounds(const gfx::Rect& bounds) {
++    // The popup is unveiled up to the width it had when it was shown.
++    if (is_unveiling_ && bounds.width() != GetWindowBoundsInScreen().width()) {
++      GetLayer()->GetAnimator()->StopAnimating();
++    }
++
+     base::AutoReset<bool> reset(&is_setting_popup_bounds_, true);
+     SetBounds(bounds);
+   }
+@@ -158,6 +176,24 @@ class OmniboxPopupViewViews::PopupWidget
+     GetLayer()->SetOpacity(1.0);
+   }
+ 
++  // Shows the popup by unveiling it sideways from the span of `origin`, which
++  // is in the popup's coordinates.
++  void ShowUnveiled(const gfx::Rect& origin) {
++    GetLayer()->SetOpacity(0.0);
++    GetLayer()->SetClipRect(gfx::Rect(origin.x(), 0, origin.width(),
++                                      kSidebarPopupUnveilClipHeight));
++    ShowInactive();
++
++    is_unveiling_ = true;
++    const auto scoped_settings = GetScopedAnimationSettings(
++        gfx::Animation::RichAnimationDuration(kSidebarPopupUnveilDuration));
++    scoped_settings->AddObserver(new ui::ClosureAnimationObserver(
++        base::BindOnce(&PopupWidget::OnUnveiled, AsWeakPtr())));
++    GetLayer()->SetOpacity(1.0);
++    GetLayer()->SetClipRect(gfx::Rect(0, 0, GetWindowBoundsInScreen().width(),
++                                      kSidebarPopupUnveilClipHeight));
++  }
++
+   void CloseAnimated() {
+     // If the opening or shrinking animations still running, abort them, as the
+     // popup is closing. This is an edge case for superhumanly fast users.
+@@ -219,8 +255,13 @@ class OmniboxPopupViewViews::PopupWidget
+   }
+ 
+  private:
+-  std::unique_ptr<ui::ScopedLayerAnimationSettings>
+-  GetScopedAnimationSettings() {
++  void OnUnveiled() {
++    is_unveiling_ = false;
++    GetLayer()->SetClipRect(gfx::Rect());
++  }
++
++  std::unique_ptr<ui::ScopedLayerAnimationSettings> GetScopedAnimationSettings(
++      std::optional<base::TimeDelta> duration = std::nullopt) {
+     auto settings = std::make_unique<ui::ScopedLayerAnimationSettings>(
+         GetLayer()->GetAnimator());
+ 
+@@ -228,7 +269,8 @@ class OmniboxPopupViewViews::PopupWidget
+ 
+     constexpr base::TimeDelta kPopupOpacityAnimationDuration =
+         base::Milliseconds(82);
+-    settings->SetTransitionDuration(kPopupOpacityAnimationDuration);
++    settings->SetTransitionDuration(
++        duration.value_or(kPopupOpacityAnimationDuration));
+ 
+     return settings;
+   }
+@@ -239,6 +281,9 @@ class OmniboxPopupViewViews::PopupWidget
+   // True if the popup's bounds are currently being set.
+   bool is_setting_popup_bounds_ = false;
+ 
++  // True while the popup is clipped to the part of it unveiled so far.
++  bool is_unveiling_ = false;
++
+   base::WeakPtrFactory<PopupWidget> weak_ptr_factory_{this};
+ };
+ 
+@@ -475,7 +520,13 @@ void OmniboxPopupViewViews::UpdatePopupA
+   widget_->SetTargetBounds(GetTargetBounds());
+ 
+   if (!was_open) {
+-    widget_->ShowAnimated();
++    if (IsHostedInVerticalTabStrip(location_bar_view_)) {
++      gfx::Rect origin = location_bar_view_->GetBoundsInScreen();
++      origin.Offset(-widget_->GetWindowBoundsInScreen().OffsetFromOrigin());
++      widget_->ShowUnveiled(origin);
++    } else {
++      widget_->ShowAnimated();
++    }
+ 
+     // Popup is now expanded and first item will be selected.
+     UpdateAccessibleStates();
+@@ -760,9 +811,7 @@ gfx::Rect OmniboxPopupViewViews::GetTarg
+ 
+   // An address bar hosted in the vertical tab strip is too narrow to read
+   // results in, so let the popup grow over the page beside it.
+-  if (const auto* toolbar =
+-          views::AsViewClass<ToolbarView>(location_bar_view_->parent());
+-      toolbar && toolbar->is_sidebar_mode() &&
++  if (IsHostedInVerticalTabStrip(location_bar_view_) &&
+       content_rect.width() < kSidebarPopupMinWidth) {
+     const gfx::Rect window_bounds =
+         location_bar_view_->GetWidget()->GetWindowBoundsInScreen();
+--- a/components/omnibox/browser/autocomplete_controller.cc
++++ b/components/omnibox/browser/autocomplete_controller.cc
+@@ -1164,9 +1164,10 @@ bool AutocompleteController::ShouldRunPr
+   }
+ 
+ #if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS)
+-  // Should only be run for the composebox.
++  // Should only be run for the composebox, and to offer the page that is
++  // already open among the suggestions shown on focus.
+   if (provider->type() == AutocompleteProvider::TYPE_VERBATIM_MATCH) {
+-    return false;
++    return omnibox_feature_configs::OmniboxUrlSuggestionsOnFocus::Get().enabled;
+   }
+ #endif
+ 
+--- a/components/omnibox/browser/omnibox_client.cc
++++ b/components/omnibox/browser/omnibox_client.cc
+@@ -22,6 +22,10 @@ bool OmniboxClient::CurrentPageExists()
+   return true;
+ }
+ 
++bool OmniboxClient::ShowsSuggestionsOnFocusForPages() const {
++  return false;
++}
++
+ const GURL& OmniboxClient::GetURL() const {
+   return GURL::EmptyGURL();
+ }
+--- a/components/omnibox/browser/omnibox_client.h
++++ b/components/omnibox/browser/omnibox_client.h
+@@ -92,6 +92,10 @@ class OmniboxClient {
+   // startup or shutdown, the omnibox may exist but have no attached page.
+   virtual bool CurrentPageExists() const;
+ 
++  // Returns whether focusing the omnibox brings up suggestions while it shows
++  // the address of a page, rather than only when it is empty.
++  virtual bool ShowsSuggestionsOnFocusForPages() const;
++
+   // Returns the virtual URL currently being displayed in the URL bar, if there
+   // is one. This URL might be a pending navigation that hasn't committed yet,
+   // so it is not guaranteed to match the current page in this WebContents.
+--- a/components/omnibox/browser/zero_suggest_verbatim_match_provider.cc
++++ b/components/omnibox/browser/zero_suggest_verbatim_match_provider.cc
+@@ -164,7 +164,12 @@ void ZeroSuggestVerbatimMatchProvider::C
+       omnibox::kVerbatimMatchZeroSuggestRelevance);
+   // Make sure the URL is formatted the same was as most visited sites.
+   auto format_types = AutocompleteMatch::GetFormatTypes(false, false);
++#if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
+   match.suggestion_group_id = omnibox::GROUP_MOBILE_SEARCH_READY_OMNIBOX;
++#else
++  // Desktop has no section of its own for the page that is already open.
++  match.suggestion_group_id = omnibox::GROUP_MOST_VISITED;
++#endif
+   match.contents = url_formatter::FormatUrl(input.current_url(), format_types,
+                                             base::UnescapeRule::SPACES, nullptr,
+                                             nullptr, nullptr);
+--- a/components/omnibox/common/omnibox_feature_configs.cc
++++ b/components/omnibox/common/omnibox_feature_configs.cc
+@@ -622,7 +622,7 @@ OmniboxZpsSuggestionLimit::OmniboxZpsSug
+           .Get();
+   max_url_suggestions =
+       base::FeatureParam<size_t>(&kOmniboxZpsSuggestionLimit,
+-                                 "OmniboxZpsMaxUrlSuggestions", 0)
++                                 "OmniboxZpsMaxUrlSuggestions", 5)
+           .Get();
+ }
+ 
+@@ -638,7 +638,7 @@ OmniboxZpsSuggestionLimit::~OmniboxZpsSu
+ 
+ BASE_FEATURE(OmniboxUrlSuggestionsOnFocus::kOmniboxUrlSuggestionsOnFocus,
+              "OmniboxUrlSuggestionsOnFocus",
+-             base::FEATURE_DISABLED_BY_DEFAULT);
++             base::FEATURE_ENABLED_BY_DEFAULT);
+ OmniboxUrlSuggestionsOnFocus::OmniboxUrlSuggestionsOnFocus() {
+   const char kMvtScoringParamRecencyFactor_Classic[] = "default";
+   enabled = base::FeatureList::IsEnabled(kOmniboxUrlSuggestionsOnFocus);

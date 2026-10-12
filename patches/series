@@ -365,6 +365,7 @@ helium/ui/layout/sidebar-toolbar-window-edges.patch
 helium/ui/layout/sidebar-toolbar-fullscreen-controls.patch
 helium/ui/layout/sidebar-toolbar-floating-geometry.patch
 helium/ui/layout/sidebar-toolbar-dock-animation.patch
+helium/ui/layout/sidebar-toolbar-omnibox-focus.patch
 
 helium/ui/generate-standard-qr-codes.patch
 helium/ui/pdf-viewer.patch
