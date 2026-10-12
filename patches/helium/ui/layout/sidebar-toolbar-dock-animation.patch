@@ -1,0 +1,187 @@
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -1046,7 +1046,7 @@ BrowserView::BrowserView(BrowserWindowIn
+   zen_top_chrome_animation_.Reset(1);
+   zen_side_chrome_animation_.SetSlideDuration(
+       gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+-  zen_side_chrome_animation_.SetTweenType(gfx::Tween::FAST_OUT_SLOW_IN_3);
++  zen_side_chrome_animation_.SetTweenType(gfx::Tween::EASE_IN_OUT);
+   zen_side_chrome_animation_.Reset(1);
+   fullscreen_caption_buttons_animation_.SetSlideDuration(
+       gfx::Animation::RichAnimationDuration(kZenModeRevealAnimationDuration));
+@@ -2025,8 +2025,25 @@ ToolbarButton* BrowserView::GetSidebarDo
+              : nullptr;
+ }
+ 
++bool BrowserView::IsSidebarToolbarFloating() const {
++  return IsSidebarToolbarHidden() || sidebar_toolbar_docking_;
++}
++
+ bool BrowserView::IsChromeAutoHideActive() const {
+-  return zen_mode_enabled_ || sidebar_toolbar_hidden_;
++  return zen_mode_enabled_ || sidebar_toolbar_hidden_ ||
++         sidebar_toolbar_docking_;
++}
++
++void BrowserView::FinishSidebarToolbarDocking() {
++  if (!sidebar_toolbar_docking_) {
++    return;
++  }
++  sidebar_toolbar_docking_ = false;
++  UpdateCaptionButtonsForSideChrome();
++  if (multi_contents_view_) {
++    multi_contents_view_->MaybeUpdateContentsBorderAndOverlay();
++  }
++  InvalidateLayout();
+ }
+ 
+ void BrowserView::UpdateSidebarToolbarHiddenState() {
+@@ -2037,6 +2054,8 @@ void BrowserView::UpdateSidebarToolbarHi
+   sidebar_toolbar_hidden_ = hidden;
+ 
+   if (hidden) {
++    sidebar_toolbar_docking_ = false;
++
+     // Focus inside the tab strip would keep it revealed.
+     views::View* const focused_view =
+         GetFocusManager() ? GetFocusManager()->GetFocusedView() : nullptr;
+@@ -2055,8 +2074,17 @@ void BrowserView::UpdateSidebarToolbarHi
+     zen_side_chrome_animation_.Hide();
+   } else {
+     side_reveal_suppressed_ = false;
++    zen_cursor_exit_timer_.Stop();
+     if (!zen_mode_enabled_ || IsZenModeSideChromePinned()) {
+-      zen_side_chrome_animation_.Reset(1);
++      // Slide back in over the contents, and only take room from them once in
++      // place. Resizing them on every step of the way would stutter.
++      sidebar_toolbar_docking_ =
++          zen_side_chrome_animation_.GetCurrentValue() < 1.0;
++      zen_side_chrome_animation_.Show();
++      if (!zen_side_chrome_animation_.is_animating()) {
++        zen_side_chrome_animation_.Reset(1);
++        FinishSidebarToolbarDocking();
++      }
+     }
+   }
+ 
+@@ -2086,7 +2114,8 @@ void BrowserView::UpdateCaptionButtonsFo
+   }
+   if (auto* frame_view = GetFrameView()) {
+     frame_view->SetCaptionButtonsOpacity(
+-        sidebar_toolbar_hidden_ && !IsVerticalTabStripRightAligned()
++        (sidebar_toolbar_hidden_ || sidebar_toolbar_docking_) &&
++                !IsVerticalTabStripRightAligned()
+             ? GetSideChromeRevealRatio()
+             : 1.0f);
+   }
+@@ -2294,8 +2323,9 @@ void BrowserView::UpdateZenModeReveal(bo
+   }
+ 
+   // Pinned VTS stays visible regardless of cursor position, unless it hosts
+-  // the toolbar and was hidden.
+-  if (IsZenModeSideChromePinned() && !sidebar_toolbar_hidden_) {
++  // the toolbar and was hidden. One that is docking is on its way to staying.
++  if (sidebar_toolbar_docking_ ||
++      (IsZenModeSideChromePinned() && !sidebar_toolbar_hidden_)) {
+     reveal_side = true;
+   }
+ 
+@@ -5999,6 +6029,17 @@ void BrowserView::AddedToWidget() {
+     return;
+   }
+ 
++  // Step the chrome reveals with the compositor rather than a timer, so that
++  // they keep up with the display's refresh rate.
++  chrome_reveal_animation_container_ =
++      base::MakeRefCounted<gfx::AnimationContainer>();
++  chrome_reveal_animation_container_->SetAnimationRunner(
++      std::make_unique<views::CompositorAnimationRunner>(GetWidget()));
++  zen_top_chrome_animation_.SetContainer(
++      chrome_reveal_animation_container_.get());
++  zen_side_chrome_animation_.SetContainer(
++      chrome_reveal_animation_container_.get());
++
+   views::ClientView::AddedToWidget();
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -7192,6 +7233,15 @@ void BrowserView::AnimationProgressed(co
+ 
+ void BrowserView::AnimationEnded(const gfx::Animation* animation) {
+   AnimationProgressed(animation);
++  if (animation == &zen_side_chrome_animation_) {
++    FinishSidebarToolbarDocking();
++  }
++}
++
++void BrowserView::AnimationCanceled(const gfx::Animation* animation) {
++  if (animation == &zen_side_chrome_animation_) {
++    FinishSidebarToolbarDocking();
++  }
+ }
+ 
+ WebAppFrameToolbarView* BrowserView::web_app_frame_toolbar() {
+--- a/chrome/browser/ui/views/frame/browser_view.h
++++ b/chrome/browser/ui/views/frame/browser_view.h
+@@ -61,6 +61,7 @@
+ #include "ui/base/pointer/touch_ui_controller.h"
+ #include "ui/events/event_observer.h"
+ #include "ui/gfx/animation/animation_delegate.h"
++#include "ui/gfx/animation/animation_container.h"
+ #include "ui/gfx/animation/slide_animation.h"
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/views/controls/button/button.h"
+@@ -374,6 +375,10 @@ class BrowserView : public BrowserWindow
+   // until the window edge is hovered.
+   bool IsSidebarToolbarHidden() const;
+ 
++  // Returns whether that tab strip lies over the contents instead of beside
++  // them, which it also does while it slides back into place.
++  bool IsSidebarToolbarFloating() const;
++
+   // Brings back a hidden vertical tab strip that hosts the toolbar, so that
+   // something can be anchored to it.
+   void RevealSidebarToolbar();
+@@ -814,6 +819,7 @@ class BrowserView : public BrowserWindow
+   // gfx::AnimationDelegate:
+   void AnimationProgressed(const gfx::Animation* animation) override;
+   void AnimationEnded(const gfx::Animation* animation) override;
++  void AnimationCanceled(const gfx::Animation* animation) override;
+ 
+   // AppMenuButtonObserver:
+   void AppMenuShown() override;
+@@ -986,6 +992,7 @@ class BrowserView : public BrowserWindow
+   // side chrome reveal.
+   bool IsChromeAutoHideActive() const;
+   void UpdateSidebarToolbarHiddenState();
++  void FinishSidebarToolbarDocking();
+   void RevealSideChromeImmediately();
+   void UpdateCaptionButtonsForSideChrome();
+ 
+@@ -1294,6 +1301,8 @@ class BrowserView : public BrowserWindow
+ 
+   // Whether the vertical tab strip that hosts the toolbar is hidden.
+   bool sidebar_toolbar_hidden_ = false;
++  // Whether it is sliding back into place after being hidden.
++  bool sidebar_toolbar_docking_ = false;
+   // Keeps a just-hidden tab strip from reappearing under a cursor that hasn't
+   // moved away yet.
+   bool side_reveal_suppressed_ = false;
+@@ -1542,6 +1551,7 @@ class BrowserView : public BrowserWindow
+ 
+   // Zen mode state.
+   std::unique_ptr<views::EventMonitor> zen_mode_event_monitor_;
++  scoped_refptr<gfx::AnimationContainer> chrome_reveal_animation_container_;
+   gfx::SlideAnimation zen_top_chrome_animation_;
+   gfx::SlideAnimation zen_side_chrome_animation_;
+   gfx::SlideAnimation fullscreen_caption_buttons_animation_;
+--- a/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
++++ b/chrome/browser/ui/views/frame/layout/browser_view_layout_delegate_impl.cc
+@@ -237,7 +237,7 @@ bool BrowserViewLayoutDelegateImpl::IsZe
+ }
+ 
+ bool BrowserViewLayoutDelegateImpl::IsSidebarToolbarHiddenForLayout() const {
+-  return browser_view_->IsSidebarToolbarHidden();
++  return browser_view_->IsSidebarToolbarFloating();
+ }
+ 
+ float BrowserViewLayoutDelegateImpl::GetTopChromeRevealRatio() const {
